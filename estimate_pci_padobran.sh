@@ -3,7 +3,7 @@
 
 #PBS -N STATSARBPCI
 #PBS -l ncpus=2
-#PBS -l mem=10GB
+#PBS -l mem=16GB
 #PBS -J 1-3060
 #PBS -o logs
 #PBS -j oe
