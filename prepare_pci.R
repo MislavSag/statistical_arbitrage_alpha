@@ -152,7 +152,7 @@ sh_file = sprintf("
 
 #PBS -N STATSARBPCI
 #PBS -l ncpus=2
-#PBS -l mem=6GB
+#PBS -l mem=10GB
 #PBS -J 1-%d
 #PBS -o logs
 #PBS -j oe
