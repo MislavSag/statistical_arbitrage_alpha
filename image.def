@@ -1,0 +1,20 @@
+Bootstrap: docker
+From: r-base:4.4.0
+
+%post
+
+  # apt
+  apt update
+  apt install libssl-dev -y
+  apt install libxml2-dev -y
+  apt install libcurl4-openssl-dev -y
+
+  # mlr3
+  R --slave -e 'install.packages("data.table")'
+  R --slave -e 'install.packages("xts")'
+  R --slave -e 'install.packages("remotes")'
+  R --slave -e 'remotes::install_github("https://github.com/MislavSag/partialAR")'
+  R --slave -e 'remotes::install_github("https://github.com/matthewclegg/partialCI")'
+
+%runscript
+  Rscript $@
