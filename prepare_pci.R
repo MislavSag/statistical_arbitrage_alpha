@@ -138,6 +138,7 @@ meta = CJ_table_1(meta, data.table(maxfact = 1:2))
 # Add to padobran
 fwrite(meta, "F:/strategies/statsarb/pci/meta.csv")
 fwrite(prices, "F:/strategies/statsarb/pci/prices.csv")
+# If on windows use winscp, otherwise use commands below
 # scp F:/strategies/statsarb/pci/meta.csv padobran:/home/jmaric/predictors_padobran/
 # scp /home/sn/data/strategies/pread/ padobran:/home/jmaric/pread/predictors_padobran/
 file.remove("F:/strategies/statsarb/pci/meta.csv")

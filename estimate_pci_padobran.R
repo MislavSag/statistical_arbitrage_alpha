@@ -173,7 +173,7 @@ for (j in 1:10) { # 1:ncol(train)
   # quasi multivariate pairs
   hedge = tryCatch(hedge.pci(train[, j], train[, -j],
                              maxfact = param_maxfact,
-                             use.multicore = FALSE,
+                             use.multicore = TRUE,
                              search_type = param_search_type),
                    error = function(e) NULL)
   if (is.null(hedge)) {
