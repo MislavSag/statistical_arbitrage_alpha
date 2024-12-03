@@ -1,6 +1,6 @@
-library(data.table)
-library(xts)
-library(partialCI)
+suppressMessages(library(data.table))
+suppressMessages(library(xts))
+suppressMessages(library(partialCI))
 
 
 # IMPORT DATA -------------------------------------------------------------
@@ -45,7 +45,7 @@ param_maxfact = meta[i, maxfact]
 # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
 pci_tests_i = list()
 s = Sys.time()
-for (j in 1:ncol(train)) {
+for (j in 1:10) { # ncol(train)
 
   # DEBUG
   print(j)
