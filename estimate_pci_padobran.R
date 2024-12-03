@@ -90,17 +90,22 @@ for (j in 1:ncol(train)) {
   # Change names
   names(metrics)[names(metrics) %in% names(hedge$pci$beta)] = paste0("beta_", seq_along(hedge$pci$beta))
   names(metrics)[names(metrics) %in% names(hedge$pci$beta.se)] = paste0("beta_", seq_along(hedge$pci$beta.se), "_se")
-  names(metrics)[names(metrics) %in% names(hedge$pci$rho.se)] = "rho_se"
-  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_M.se)] = "sigma_M_se"
-  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_R.se)] = "sigma_R_se"
-  names(metrics)[names(metrics) %in% names(hedge$pci$M0.se)] = "M0_se"
-  names(metrics)[names(metrics) %in% names(hedge$pci$R0.se)] = "R0_se"
+  names(metrics)[names(metrics) %in% names(hedge$pci$rho.se)][2] = "rho_se"
+  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_M.se)][2] = "sigma_M_se"
+  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_R.se)][2] = "sigma_R_se"
+  names(metrics)[names(metrics) %in% names(hedge$pci$M0.se)][2] = "M0_se"
+  names(metrics)[names(metrics) %in% names(hedge$pci$R0.se)][2] = "R0_se"
 
   # Convert to data.table, add resulsts to metricsa and p values
   metrics = as.data.table(as.list(metrics))
   results = cbind(results, metrics)
 
-  pci_tests_i[[j]] = cbind(results,
+  pci_tests_i[[j]] = cbind(search_type = param_search_type,
+                           maxfact = param_maxfact,
+                           train_size = meta[i, train_size],
+                           train_start = meta[i, train_start],
+                           train_end = meta[i, train_end],
+                           results,
                            p_rw = test_pci$p.value[1],
                            p_ar = test_pci$p.value[2])
 }
