@@ -17,7 +17,7 @@ if (interactive()) {
 # PREPARE DATA ------------------------------------------------------------
 # i'th row from meta
 if (interactive()) {
-  i = 1234
+  i = 1
 } else {
   i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
 }
@@ -49,6 +49,7 @@ for (j in 1:ncol(train)) { # ncol(train)
 
   # DEBUG
   print(j)
+  # j = which(names(train) == "abh")
 
   # quasi multivariate pairs
   hedge = tryCatch(hedge.pci(train[, j], train[, -j],
@@ -99,6 +100,10 @@ for (j in 1:ncol(train)) { # ncol(train)
   # Convert to data.table, add resulsts to metricsa and p values
   metrics = as.data.table(as.list(metrics))
   results = cbind(results, metrics)
+
+  # TEST: Compare to fit.pci
+  # fit.pci(train[, j], train[, "cha.1"])
+  # train[, c("abh", "cha.1")]
 
   pci_tests_i[[j]] = cbind(search_type = param_search_type,
                            maxfact = param_maxfact,
