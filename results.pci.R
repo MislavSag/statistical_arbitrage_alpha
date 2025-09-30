@@ -32,8 +32,8 @@ pci_tests[, .(pvmr_miss = sum(is.na(pvmr)),
 pci_tests = na.omit(pci_tests, cols = c("pvmr", "rho", "p_rw", "p_ar", "negloglik"))
 
 # Check one meta row
-pci_test[search_type == "lasso" & maxfact == 1 & train_size == 24]
-pci_test[search_type == "lasso" & maxfact == 1 & train_size == 24] |>
+pci_tests[search_type == "lasso" & maxfact == 1 & train_size == 24]
+pci_tests[search_type == "lasso" & maxfact == 1 & train_size == 24] |>
   _[pvmr > 0.5  & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05 &
       negloglik <= quantile(negloglik, probs = 0.25)]
 
@@ -228,7 +228,7 @@ pairs_trading_pci_performance = function(train_start,
   spread_var = sd(spread_train)
   if (spread_var == 0) {
     print("Spread variance is zero")
-    return(NULL)
+    return(NA)
   }
   Z_score_M = spread/spread_var
 
@@ -243,7 +243,7 @@ pairs_trading_pci_performance = function(train_start,
     error = function(e) NULL)
   if (is.null(signal)) {
     print("Error in signal generation")
-    return(NULL)
+    return(NA)
   }
 
   # let's compute the PnL directly from the signal and spread
@@ -259,7 +259,7 @@ pairs_trading_pci_performance = function(train_start,
     traded_return = traded_return[paste0(train_start, "/", train_end)]
   }
 
-  return(traded_return)
+  return(mean(traded_return, na.rm = TRUE) / sd(traded_return, na.rm = TRUE))
 }
 
 # example
@@ -272,14 +272,74 @@ pairs_trading_pci_performance(
   std_entry = 1
 )
 
-# Define all parameters
-params = expand.grid(
-  train_start = meta,
-  train_end = pci_tests_eligible[, train_end],
-  ticker_1 = pci_tests_eligible[, series_1],
-  ticker_2 = pci_tests_eligible[, series_2],
-  std_entry = 1
-)
+############ NOT SURE WHAT IS META HERE ###############
+# # Define all parameters
+# params = expand.grid(
+#   train_start = meta,
+#   train_end = pci_tests_eligible[, train_end],
+#   ticker_1 = pci_tests_eligible[, series_1],
+#   ticker_2 = pci_tests_eligible[, series_2],
+#   std_entry = 1
+# )
+############ NOT SURE WHAT IS META HERE ###############
+
+# Generate results for my params. Later above is for all parameters
+pci_tests_eligible_sample = pci_tests_eligible[
+  search_type == "lasso" & maxfact ==1 & train_size == 24
+]
+s = Sys.time()
+pnl_by_i = vapply(1:nrow(pci_tests_eligible_sample), function(j) {
+  print(j)
+  pairs_trading_pci_performance(
+    train_start = pci_tests_eligible_sample[j, train_start],
+    train_end = pci_tests_eligible_sample[j, train_end],
+    ticker_1 = pci_tests_eligible_sample[j, series_1],
+    ticker_2 = pci_tests_eligible_sample[j, series_2],
+    std_entry = 1,
+    set = "train"
+  )
+}, FUN.VALUE = numeric(1))
+e = Sys.time()
+e - s
+cbind(pci_tests_eligible_sample[1:20], pnl_by_i)
+
+# Merge pairs data and insample results
+pairs_insample = cbind(pci_tests_eligible_sample, pnl_by_i)
+
+# Extract best pairs for date
+setorder(pairs_insample, train_end, -pnl_by_i)
+pairs_insample_best = pairs_insample[, head(.SD, 20), by = train_end]
+
+# Define dates
+dates = pairs_insample_best[, sort(unique(train_end))]
+
+# Delete files on blob
+bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
+                               Sys.getenv("BLOB-KEY"))
+cont = storage_container(bl_endp_key, "qc-backtest")
+files_remove = AzureStor::list_blobs(cont)
+files_remove = files_remove$name[grepl("pci-", files_remove$name)]
+for (f in files_remove) {
+  AzureStor::delete_blob(cont, f, confirm = FALSE)
+}
+
+# Extract for every month and save every file separetly
+cont = storage_container(bl_endp_key, "qc-backtest")
+for (d in dates) {
+  # d = dates[1]
+  print(d)
+
+  # Save
+  best_pairs = pairs_insample_best[train_end == d]
+  file_name_ = paste0("pci-", as.Date(d), ".csv")
+  storage_write_csv(as.data.frame(best_pairs), cont, file_name_)
+}
+
+
+
+
+
+
 
 # Generate for all pairs for all meta rows
 plan(multisession, workers = 8L)
@@ -339,6 +399,93 @@ pnl_by_i = do.call(cbind, pnl_by_i)
 
 Return.portfolio(pnl_by_i)
 charts.PerformanceSummary(Return.portfolio(pnl_by_i))
+
+
+
+# UNIVERSE BY MONTH QC ----------------------------------------------------
+# Choose parameters
+param_search_type_qc = "lasso"
+param_maxfact_qc = 1
+param_train_size_qc = 24
+pci_tests_eligible
+pci_eligible_qc = pci_tests_eligible[
+  search_type == param_search_type_qc &
+    maxfact == param_maxfact_qc &
+    train_size == param_train_size_qc
+]
+setorder(pci_eligible_qc, train_start)
+
+# main function to analyse pairs
+pairs_trading_pci = function(n, std_entry = 2, plot_pnl = TRUE) {
+  # Get tickers
+  ticker_1 = pci_tests_eligible[n, series_1]
+  ticker_2 = pci_tests_eligible[n, series_2]
+
+  # Fit pci and get spreads
+  fit_pci = fit.pci(train[, ticker_1], train[, ticker_2])
+  hs_train = statehistory.pci(fit_pci)
+  spread = xts(hs_train[, 4], as.Date(rownames(hs_train)))
+
+  # Z-score
+  spread_var = sd(spread_train)
+  Z_score_M = spread/spread_var
+
+  # generate signals with z scored
+  threshold_long = threshold_short = Z_score_M
+  threshold_short[] = std_entry
+  threshold_long[] = -std_entry
+
+  # get and plot signals
+  signal = generate_signal_zscore(Z_score_M, threshold_long, threshold_short)
+
+  # let's compute the PnL directly from the signal and spread
+  spread_return = diff(Z_score_M)
+  traded_return = spread_return * lag(signal)   # NOTE THE LAG!!
+  traded_return[is.na(traded_return)] = 0
+  colnames(traded_return) = "traded spread"
+
+  # Total
+  res_ = mean(traded_return, na.rm = TRUE)
+  sd_ = sd(traded_return, na.rm = TRUE)
+
+  return(res_ / sd_)
+}
+
+# Get insample results
+results = vapply(1:nrow(pci_eligible_qc),
+                 function(i) pairs_trading_pci(i),
+                 FUN.VALUE = numeric(1L))
+results_dt = cbind(pci_tests_eligible, insample_performance = results)
+
+# Inspect 20 best
+setorder(results_dt, -insample_performance, na.last = TRUE)
+results_dt
+
+# Define dates
+dates = pci_eligible_qc[, sort(unique(train_end))]
+
+# Delete files on blob
+bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
+                               Sys.getenv("BLOB-KEY"))
+cont = storage_container(bl_endp_key, "qc-backtest")
+files_remove = AzureStor::list_blobs(cont)
+files_remove = files_remove$name[grepl("pci-", files_remove$name)]
+for (f in files_remove) {
+  AzureStor::delete_blob(cont, f, confirm = FALSE)
+}
+
+# Extract for every month and save every file separetly
+cont = storage_container(bl_endp_key, "qc-backtest")
+for (d in dates) {
+  # d = dates[1]
+  print(d)
+
+  # Save
+  best_pairs = pci_eligible_qc[train_end == d]
+  file_name_ = paste0("pci-", as.Date(d), ".csv")
+  storage_write_csv(as.data.frame(best_pairs), cont, file_name_)
+}
+
 
 
 # DATA FOR QC -------------------------------------------------------------
@@ -436,8 +583,15 @@ bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
                                Sys.getenv("BLOB-KEY"))
 cont = storage_container(bl_endp_key, "qc-backtest")
 sample_ = qc_data[date > as.Date("2020-01-01")]
+sample_[, unique(date)]
 sample_[, date := paste0(date, " 15:59:00")]
-storage_write_csv(sample_, cont, "pci.csv", col_names = FALSE)
+sample_ = sample_[, .(
+  symbol_1 = paste0(symbol_1, collapse = "|"),
+  symbol_2 = paste0(symbol_2, collapse = "|"),
+  beta = paste0(beta, collapse = "|"),
+  spread = paste0(Z_score_M, collapse = "|")
+), by = date]
+storage_write_csv(sample_, cont, "pci_p.csv", col_names = TRUE)
 
 # # save data to QC
 # bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),

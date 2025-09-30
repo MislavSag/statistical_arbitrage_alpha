@@ -1,0 +1,28 @@
+---
+title: "RW equity pairs trading"
+format: html
+editor: visual
+---
+
+## 
+
+# Time series features
+
+## Spread data
+
+For each pair in the universe calculate:
+
+-   Ratio of their prices
+
+-   20d rolling mean of the ratio
+
+-   20d standard deviation of the ratio
+
+-   zscore of the ratio - $(price-mean)/stdev$
+
+Questions:
+
+1.  Why do you calculate `lsr` and `distance` futures on monthly basis (group by month) and than you sum by year? Whay do you don't calculate those features on year basis in the begining?
+2.  What should we do with 2 stocks for same company, say GOOG and GOOGL?
+3.  Should we explude ETF's and/or funds?
+4.  

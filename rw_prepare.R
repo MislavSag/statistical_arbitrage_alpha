@@ -1,0 +1,390 @@
+library(fastverse)
+library(finutils)
+library(ggplot2)
+library(arrow)
+library(httr)
+library(roll)
+library(lubridate)
+library(AzureStor)
+
+
+# SETUP -------------------------------------------------------------------
+# Save path
+PATH_SAVE = "D:/strategies/statsarb"
+
+
+# DATA --------------------------------------------------------------------
+# Import daily data
+prices = qc_daily_parquet(
+  file_path = "F:/lean/data/all_stocks_daily",
+  min_obs = 2 * 252,
+  price_threshold = 1e-008,
+  duplicates = "fast",
+  add_dv_rank = FALSE,
+  add_day_of_month = FALSE,
+  etfs = FALSE,
+  profiles_fmp = TRUE,
+  fmp_api_key = "6c390b6279b8a67cc7f63cbecbd69430"
+)
+prices[, y := data.table::year(date)]
+prices[, q := data.table::yearqtr(date)]
+prices[, fmp_ticker := gsub("\\.\\d+", "", toupper(symbol))]
+symbols = prices[, unique(fmp_ticker)]
+
+# Market cap
+mcap = read_parquet("F:/data/equity/us/fundamentals/market_cap.parquet")
+mcap = mcap[symbol %in% symbols]
+setorder(mcap, symbol, date)
+setnames(mcap, "symbol", "fmp_ticker")
+plot(mcap[fmp_ticker == "MSFT", marketCap], main = "MSFT")
+plot(mcap[fmp_ticker == "META", marketCap], main = "META")
+
+# Merge prices and market cap
+prices = merge(prices, mcap, by = c("fmp_ticker", "date"), all.x = TRUE, all.y = FALSE)
+prices[, sum(is.na(marketCap)) / nrow(prices)]
+
+# Get profiles for industry
+parts = 0:10
+for (part in parts) {
+  GET("https://financialmodelingprep.com/stable/profile-bulk",
+      query = list(apikey = "6c390b6279b8a67cc7f63cbecbd69430", part = part),
+      write_disk(paste0("profile_", part, ".csv")))
+}
+profile_files = paste0("profile_", parts, ".csv")
+profile = lapply(profile_files, fread)
+profile = rbindlist(profile, fill = TRUE)
+profile = unique(profile, by = "symbol")
+profile = profile[symbol %in% symbols]
+lapply(profile_files, file.remove)
+
+# Merge prices and profile
+profile_sample = profile[, .(symbol, sector, industry, isEtf)]
+setnames(profile_sample, "symbol", "fmp_ticker")
+
+
+# LIQUID UNIVERSE ---------------------------------------------------------
+# Averge unadjusted price > 5
+coarse_avg_price = prices[, .(avg_price = mean(close_raw)), by = .(symbol, q)]
+coarse_avg_price[, universe_avg_price := FALSE]
+coarse_avg_price[shift(avg_price) >= 5, universe_avg_price := TRUE, by = symbol]
+print(paste0("We remove ",
+             round(sum(coarse_avg_price$universe_avg_price == FALSE) / nrow(coarse_avg_price) * 100),
+             "% of rows."))
+
+# Average volume > 300.000
+coarse_avg_vol = prices[, .(avg_volume = mean(volume)), by = .(symbol, q)]
+coarse_avg_vol[, universe_avg_vol := FALSE]
+coarse_avg_vol[shift(avg_volume) >= 300000, universe_avg_vol := TRUE, by = symbol]
+print(paste0("We remove ",
+             round(sum(coarse_avg_vol$universe_avg_vol == FALSE) / nrow(coarse_avg_vol) * 100),
+             "% of rows."))
+
+# Average market cap > 1 bil
+coarse_avg_mcap = prices[, .(avg_mcap = data.table::last(marketCap)), by = .(symbol, q)]
+coarse_avg_mcap[, universe_avg_mcap := FALSE]
+coarse_avg_mcap[shift(avg_mcap) >= 1e9, universe_avg_mcap := TRUE, by = symbol]
+print(paste0("We remove ",
+             round(sum(coarse_avg_mcap$universe_avg_mcap == FALSE) / nrow(coarse_avg_mcap) * 100),
+             "% of rows."))
+
+# Combine coarse
+coarse = merge(coarse_avg_price, coarse_avg_vol, by = c("symbol", "q"))
+coarse = merge(coarse, coarse_avg_mcap, by = c("symbol", "q"))
+coarse[, universe := (universe_avg_vol + universe_avg_price + universe_avg_mcap) == 3]
+coarse = coarse[y > 1998]
+
+# Plots
+bins_ = coarse[, min(q)]:coarse[, max(q)]
+coarse[universe == TRUE][, .N, by = q][order(q)] |>
+  ggplot(aes(q, N)) +
+  geom_col() +
+  scale_x_binned(breaks = bins_)
+
+# Keep only coarse universe
+prices_coarse = merge(prices, coarse[, .(symbol, q, universe)], by = c("symbol", "q"), all.x = TRUE)
+prices_coarse = prices_coarse[universe == TRUE]
+
+
+# PAIRS -------------------------------------------------------------------
+# Merge coarse prices and profiles
+prices_coarse = merge(prices_coarse, profile_sample, by = "fmp_ticker")
+prices_coarse[, unique(sector)]
+prices_coarse[, unique(industry)]
+
+# Create pairs for every quarter
+quarters = prices_coarse[, sort(unique(q))]
+pairs_universe = list()
+for (i in seq_along(quarters)) {
+  print(i)
+  # data
+  q_ = quarters[i]
+  dt_ = prices_coarse[q == q_]
+
+  # create all possible pairs
+  pairs_all = dt_[, unique(fmp_ticker)]
+  pairs_all = CJ(stock1 = pairs_all, stock2 = pairs_all, unique = TRUE)
+  pairs_all = pairs_all[stock1 != stock2]
+  pairs_all[, `:=`(first = pmin(stock1, stock2), second = pmax(stock1, stock2))]
+  pairs_all = unique(pairs_all, by = c("first", "second"))
+  pairs_all[, c("first", "second") := NULL]
+
+  # Merge industries and sectors for each stock in the pair
+  pairs_all = merge(pairs_all, profile_sample, by.x = "stock1", by.y = "fmp_ticker")
+  cols = c("sector", "industry", "isEtf")
+  setnames(pairs_all, cols, paste0(cols, "_stock1"))
+  pairs_all = merge(pairs_all, profile_sample, by.x = "stock2", by.y = "fmp_ticker")
+  setnames(pairs_all, cols, paste0(cols, "_stock2"))
+  pairs_all[, same_sector := 0]
+  pairs_all[sector_stock1 == sector_stock2, same_sector := 1]
+  pairs_all = merge(pairs_all, profile_sample, by.x = "stock2", by.y = "fmp_ticker")
+  pairs_all[, same_industry := 0]
+  pairs_all[industry_stock1 == industry_stock2, same_industry := 1]
+  pairs_all = pairs_all[, .(stock1, stock2, same_sector, same_industry)]
+
+  # merge year and save to list
+  pairs_all[, q := q_]
+  pairs_universe[[i]] = pairs_all
+}
+pairs_universe = rbindlist(pairs_universe)
+setorder(pairs_universe, q)
+
+
+# TIME SERIES FEATURES ----------------------------------------------------
+# TODO: Choose year, but later maybe expand for all years
+# YEARS = 2020:2025
+QUARTERS = prices_coarse[, sort(unique(q))]
+STARTY   = 2022
+pairs_universe_l = list()
+for (i in seq_along(QUARTERS)) {
+  # Extract year
+  # i = 80
+  print(i)
+
+  # Choose last quartal
+  Q = QUARTERS[i]
+
+  # Test if qaurter in set
+  if (QUARTERS[i] < STARTY) {
+    pairs_universe_l[[i]] = NULL
+    next
+  }
+
+  # Extract last 4 quarters
+  # qs = QUARTERS[(i - 5):(i - 1)]
+
+  # Spreads
+  pairsy = pairs_universe[q == Q]
+
+  # DEBUG
+  # pairsy[stock1 == "PAA" & stock2 == "PAGP"]
+  # pairsy[stock1 == "BEP" & stock2 == "BEPC"]
+  # pairsy[stock1 == "MCO" & stock2 == "SPGI"]
+  # pairsy[stock1 == "ASB" & stock2 == "HBAN"]
+  # pairsy[stock1 == "KNX" & stock2 == "WERN"]
+  # chunks = pairsy[(stock1 == "PAA" & stock2 == "PAGP") |
+  #                   (stock1 == "BEP" & stock2 == "BEPC")]
+  # dt_ = copy(chunks)
+
+  # Divide number of rows of pairs universe to 100 chunks
+  chunks = split(pairsy, cut(1:nrow(pairsy), breaks = 75))
+
+  # Loop over chunks to calcluate time series features
+  pairs_time_series_features_l = list()
+  for (j in seq_along(chunks)) {
+    # j = 1
+    print(j)
+    # Prepare chunk
+    dt_ = chunks[[j]]
+    dt_ = dt_[, .(stock1, stock2)]
+    start_date = zoo::as.Date.yearqtr(Q-0.25) - 365 - 30
+    end_date   = zoo::as.Date.yearqtr(Q-0.25)
+    dates = prices[date %between% c(start_date, end_date), sort(unique(date))]
+    dt_ = dt_[, .(date = dates), by = .(stock1, stock2)]
+
+    # Merge prices with pairs and dates
+    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock1", "date")]
+    setnames(dt_, c("fmp_ticker", "close"), c("stock1", "close1"))
+    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock2", "date")]
+    setnames(dt_, c("fmp_ticker", "close"), c("stock2", "close2"))
+    dt_ = unique(dt_, by = c("stock1", "stock2", "date"))
+    dt_[, ratiospread := close1 / close2]
+    dt_[, spreadclose := log(ratiospread)]
+
+    # Calculate Z scores
+    dt_[, sma20  := frollmean(spreadclose, 20, na.rm = TRUE), by = .(stock1, stock2)]
+    dt_[, sd20   := roll_sd(spreadclose, 20), by = .(stock1, stock2)]
+    dt_[, zscore := (spreadclose - sma20) / sd20]
+
+    # Calculate returns
+    dt_[, logreturns := spreadclose - shift(spreadclose), by = .(stock1, stock1)]
+
+    # DEBUG
+    # dt_[stock1 == "ABB" & stock2 == "ABCB"]
+    # dt_[stock1 == "ABB" & stock2 == "ABCB", .(date, logreturns)]
+    # plot(as.xts.data.table(dt_[stock1 == "PAA" & stock2 == "PAGP", .(date, logreturns)]))
+
+    # Neg lag zscore - this is the weight we apply
+    dt_[, neg_lagged_zscore := shift(-zscore), by = .(stock1, stock2)]
+
+    # Calculate the daily returns of the strategy by multiplying the lagged z-score with the daily returns of the spread
+    dt_[, lsr := neg_lagged_zscore * logreturns]
+
+    # Create month columnd222.138
+    dt_[, month := ceiling_date(date, "month") - 1]
+
+    # Normalize prices by stock1, stock2 and month
+    dt_[, let(
+      normalized1 = close1 / data.table::first(close1),
+      normalized2 = close2 / data.table::first(close2)
+    ), by = .(stock1, stock2, month)]
+
+    # Aggregate to monthly data
+    dtm_ = dt_[, .(lsr = sum(lsr, na.rm = TRUE) / sd(lsr, na.rm = TRUE),
+                   distance = sum((normalized1 - normalized2)^2)),
+               by = .(stock1, stock2, month)]
+
+    # Aggregate to yearly data
+    dtq_ = dtm_[, .(lsr = sum(lsr, na.rm = TRUE),
+                    distance = sum(distance, na.rm = TRUE)),
+                by = .(stock1, stock2)]
+    dtq_[, q := Q - 0.25]
+    pairs_time_series_features_l[[j]] = dtq_
+  }
+  pairs_time_series_features = rbindlist(pairs_time_series_features_l)
+
+  # Ranks
+  pairs_time_series_features[, lsr_rank := frankv(lsr, order = -1L, ties.method = "first"), by = q]
+  pairs_time_series_features[, ed_rank := frank(distance, ties.method = "first"), by = q]
+
+  # Quantile bucketize
+  # pairs_time_series_features[, lsr_bucket := cut(lsr, breaks = quantile(lsr, probs = 0:100/100), labels = 1:100, right = FALSE), by = y]
+  # pairs_time_series_features[, ed_bucket := cut(-distance, breaks = quantile(-distance, probs = 0:100/100), labels = 1:100, right = FALSE), by = y]
+  # pairs_time_series_features[, names(.SD) := lapply(.SD, as.integer), .SDcols = c("lsr_bucket", "ed_bucket")]
+  pairs_time_series_features[, lsr_bucket := .bincode(lsr, breaks = quantile(pairs_time_series_features$lsr, probs = 0:100/100)), by = q]
+  pairs_time_series_features[, ed_bucket  := .bincode(-distance, breaks = quantile(-distance, probs = 0:100/100)), by = q]
+
+  # DEBUG
+  # pairs_time_series_features[stock1 == "PAA" & stock2 == "PAGP"]
+  # pairs_time_series_features[stock1 == "PAGP" & stock2 == "PAA"]
+  # pairs_time_series_features[stock1 == "BEP" & stock2 == "BEPC"]
+  # pairs_time_series_features[stock1 == "BEPC" & stock2 == "BEP"]
+
+  # Merge pairs_time_series_features and
+  pairs_universe_ = merge(pairs_time_series_features, pairs_universe,
+                          by = c("stock1", "stock2", "q"), all.x = TRUE, all.y = FALSE)
+  pairs_universe_l[[i]] = na.omit(pairs_universe_)
+}
+
+# Merge results for all pairs
+pairs_features = rbindlist(pairs_universe_l)
+fwrite(pairs_features, file.path(PATH_SAVE, "pairs_features.csv"))
+
+# Combined scores
+setorder(pairs_features, stock1, stock2, q)
+# Give more weigts to newer data
+test = pairs_features[1:1000] |>
+  _[, .(lsr_bucket, ed_bucket, q, (roll::roll_mean(lsr_bucket, 8, weights = 1:8, min_obs = 8) +
+          roll::roll_mean(ed_bucket, 8, weights = 1:8, min_obs = 8)) / 2), by = .(stock1, stock2)]
+head(test, 20)
+tail(test, 20)
+pairs_features[, combo_score := (roll::roll_mean(lsr_bucket, 8, weights = 1:8, min_obs = 8) +
+                    roll::roll_mean(ed_bucket, 8, weights = 1:8, min_obs = 8)) / 2,
+               by = .(stock1, stock2)]
+
+# Check number of NA's
+pairs_features[, sort(unique((q)))]
+pairs_features[, sum(is.na(combo_score)) / nrow(pairs_features) * 100]
+pairs_features[q > 2023.5][, sum(is.na(combo_score)) / nrow(pairs_features) * 100]
+
+# Convert to wide format by year
+pairs_combo = dcast(pairs_features, stock1 + stock2 + same_sector + same_industry ~ q * 100, value.var = "combo_score")
+
+# # Create combo rank
+# colnames(pairs_features)
+# pairs_features[, let(
+#   combo_score_2024 = (
+#     lsr_bucket_2024 * 3 + ed_bucket_2024 * 3 + lsr_bucket_2023 * 2 +
+#       ed_bucket_2023 * 2 + lsr_bucket_2022 + ed_bucket_2022) / (3 + 3 + 2 + 2 + 1 + 1),
+#   combo_score_2023 = (
+#     lsr_bucket_2023 * 3 + ed_bucket_2023 * 3 + lsr_bucket_2022 * 2 +
+#       ed_bucket_2022 * 2 + lsr_bucket_2021 + ed_bucket_2021) / (3 + 3 + 2 + 2 + 1 + 1),
+#   combo_score_2022 = (
+#     lsr_bucket_2022 * 3 + ed_bucket_2022 * 3 + lsr_bucket_2021 * 2 +
+#       ed_bucket_2021 * 2 + lsr_bucket_2020 + ed_bucket_2020) / (3 + 3 + 2 + 2 + 1 + 1),
+#   combo_score_2021 = (
+#     lsr_bucket_2021 * 3 + ed_bucket_2021 * 3 + lsr_bucket_2020 * 2 +
+#       ed_bucket_2020 * 2 + lsr_bucket_2019 + ed_bucket_2019) / (3 + 3 + 2 + 2 + 1 + 1)
+# )]
+
+# Add data from profiles
+profile[, .(isin  = sum(nzchar(isin)),
+            cik   = sum(nzchar(cik)),
+            cusip = sum(nzchar(cusip)))]
+profile_cols = c("symbol", "isin", "isEtf", "isFund", "companyName", "currency",
+                 "exchange", "country", "sector", "industry")
+profile_meta = profile[, ..profile_cols]
+pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
+setnames(pairs_combo, profile_cols[-1], c("isin1", "isetf1", "isfund1", "name1", "currency1", "exchange1", "country1",
+                                          "sector1", "industry1"))
+pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
+setnames(pairs_combo, profile_cols[-1], c("isin2","isetf2", "isfund2", "name2", "currency2", "exchange2", "country2",
+                                          "sector2", "industry2"))
+
+# Save
+fwrite(pairs_combo, file.path(PATH_SAVE, "pairs_combo.csv"))
+
+# Summary
+pairs_combo[, sum(same_industry == 1) / nrow(pairs_combo) * 100]
+
+# Save best
+cols = colnames(pairs_combo)[grepl("^\\d+$", colnames(pairs_combo))]
+cols = c("stock1", "stock2", cols)
+best = pairs_combo[
+  # same_industry == 1 &
+  same_sector == 1 &
+    isfund1 == FALSE & isfund2 == FALSE &
+    isetf1 == FALSE & isetf2 == FALSE &
+    # country1 == country2 &
+    name1 != name2 & isin1 != isin2, ..cols]
+na.omit(best, cols = c("202475"))[order(-`202475`)] # Test
+na.omit(best, cols = c("202500"))[order(-`202500`)] # Test
+best = melt(best, id.vars = c("stock1", "stock2"))
+best = na.omit(best)
+best[1, as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
+best[, q := as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
+best[, variable := NULL]
+setorder(best, q, -value)
+
+# Save best
+fwrite(best, file.path(PATH_SAVE, "pairs_best_q.csv"))
+
+# Save to Azure
+bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
+                               Sys.getenv("BLOB-KEY"))
+cont = storage_container(bl_endp_key, "qc-backtest")
+storage_write_csv(as.data.frame(best), cont, "pairs_best_q.csv")
+
+# Checks
+best[stock1 == "PAA" & stock2 == "PAGP"]
+best[stock1 == "BEP" & stock2 == "BEPC"]
+best[stock1 == "MCO" & stock2 == "SPGI"]
+best[stock1 == "ASB" & stock2 == "HBAN"]
+best[stock1 == "KNX" & stock2 == "WERN"]
+best[stock1 == "LADR" & stock2 == "RITM"]
+
+
+
+# DEEP ANALYSE ------------------------------------------------------------
+# Check best
+best_ = merge(best, pairs_combo[, .(stock1, stock2, exchange1, exchange2,
+                                    country1, country2, currency1, currency2,
+                                    same_sector)],
+              by = c("stock1", "stock2"), all.x = TRUE, all.y = FALSE)
+best_ = merge(best_, profile_sample,
+              by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
+setnames(best_, c("sector", "industry"), c("sector1", "industry1"))
+best_ = merge(best_, profile_sample,
+              by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
+setnames(best_, c("sector", "industry"), c("sector2", "industry2"))
+
+
