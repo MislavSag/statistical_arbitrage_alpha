@@ -11,6 +11,8 @@ library(AzureStor)
 # SETUP -------------------------------------------------------------------
 # Save path
 PATH_SAVE = "D:/strategies/statsarb"
+PATH_LEAN = "C:/Users/Mislav/qc_snp/data"
+PATH_DATA = "F:/data/equity/us"
 
 
 # DATA --------------------------------------------------------------------
@@ -19,7 +21,7 @@ prices = coarse(
   min_mean_mon_price = 5,
   min_mean_mon_volume = 100000,
   dollar_vol_n = 3000,
-  file_path = "F:/lean/data/all_stocks_daily",
+  file_path = file.path(PATH_LEAN, "all_stocks_daily"),
   min_obs = 2 * 252,
   price_threshold = 1e-008,
   duplicates = "fast",
@@ -27,7 +29,8 @@ prices = coarse(
   add_day_of_month = FALSE,
   etfs = FALSE,
   profiles_fmp = TRUE,
-  fmp_api_key = "6c390b6279b8a67cc7f63cbecbd69430"
+  fmp_api_key = "6c390b6279b8a67cc7f63cbecbd69430",
+  min_last_mon_mcap = file.path(PATH_DATA, "fundamentals", "market_cap.parquet")
 )
 
 # Create quaterly column
@@ -42,6 +45,9 @@ prices[, .N, by = q][order(q)] |>
 
 # Metadata for every stock
 profile = unique(prices[, .(fmp_symbol, industry, sector, isEtf, isFund)])
+profile_cols = c("symbol", "isin", "companyName", "currency", "exchange", "country")
+profile_meta = unique(prices[, .(fmp_symbol, industry, sector, isEtf, isFund,
+                                 isin, currency, exchange, country)])
 
 
 # PAIRS -------------------------------------------------------------------
@@ -85,31 +91,23 @@ for (i in seq_along(quarters)) {
   pairs_universe[[i]] = pairs_all
 }
 pairs_universe = rbindlist(pairs_universe)
-# 51.1582.065
-#
 setorder(pairs_universe, q)
-nrow(pairs_universe)
+nrow(pairs_universe) # 395.898.227
 
 
 # TIME SERIES FEATURES ----------------------------------------------------
 # TODO: Choose year, but later maybe expand for all years
 # YEARS = 2020:2025
-QUARTERS = prices_coarse[, sort(unique(q))]
-STARTY   = 2022
+STARTY   = 2020
+QUARTERS = prices[q >= STARTY, sort(unique(q))]
 pairs_universe_l = list()
 for (i in seq_along(QUARTERS)) {
   # Extract year
-  # i = 80
+  # i = 5
   print(i)
 
   # Choose last quartal
   Q = QUARTERS[i]
-
-  # Test if qaurter in set
-  if (QUARTERS[i] < STARTY) {
-    pairs_universe_l[[i]] = NULL
-    next
-  }
 
   # Extract last 4 quarters
   # qs = QUARTERS[(i - 5):(i - 1)]
@@ -144,10 +142,10 @@ for (i in seq_along(QUARTERS)) {
     dt_ = dt_[, .(date = dates), by = .(stock1, stock2)]
 
     # Merge prices with pairs and dates
-    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock1", "date")]
-    setnames(dt_, c("fmp_ticker", "close"), c("stock1", "close1"))
-    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock2", "date")]
-    setnames(dt_, c("fmp_ticker", "close"), c("stock2", "close2"))
+    dt_ = prices[, .(fmp_symbol, date, close)][dt_, on = c("fmp_symbol" = "stock1", "date")]
+    setnames(dt_, c("fmp_symbol", "close"), c("stock1", "close1"))
+    dt_ = prices[, .(fmp_symbol, date, close)][dt_, on = c("fmp_symbol" = "stock2", "date")]
+    setnames(dt_, c("fmp_symbol", "close"), c("stock2", "close2"))
     dt_ = unique(dt_, by = c("stock1", "stock2", "date"))
     dt_[, ratiospread := close1 / close2]
     dt_[, spreadclose := log(ratiospread)]
@@ -241,92 +239,14 @@ pairs_features[q > 2023.5][, sum(is.na(combo_score)) / nrow(pairs_features) * 10
 # Convert to wide format by year
 pairs_combo = dcast(pairs_features, stock1 + stock2 + same_sector + same_industry ~ q * 100, value.var = "combo_score")
 
-# # Create combo rank
-# colnames(pairs_features)
-# pairs_features[, let(
-#   combo_score_2024 = (
-#     lsr_bucket_2024 * 3 + ed_bucket_2024 * 3 + lsr_bucket_2023 * 2 +
-#       ed_bucket_2023 * 2 + lsr_bucket_2022 + ed_bucket_2022) / (3 + 3 + 2 + 2 + 1 + 1),
-#   combo_score_2023 = (
-#     lsr_bucket_2023 * 3 + ed_bucket_2023 * 3 + lsr_bucket_2022 * 2 +
-#       ed_bucket_2022 * 2 + lsr_bucket_2021 + ed_bucket_2021) / (3 + 3 + 2 + 2 + 1 + 1),
-#   combo_score_2022 = (
-#     lsr_bucket_2022 * 3 + ed_bucket_2022 * 3 + lsr_bucket_2021 * 2 +
-#       ed_bucket_2021 * 2 + lsr_bucket_2020 + ed_bucket_2020) / (3 + 3 + 2 + 2 + 1 + 1),
-#   combo_score_2021 = (
-#     lsr_bucket_2021 * 3 + ed_bucket_2021 * 3 + lsr_bucket_2020 * 2 +
-#       ed_bucket_2020 * 2 + lsr_bucket_2019 + ed_bucket_2019) / (3 + 3 + 2 + 2 + 1 + 1)
-# )]
-
 # Add data from profiles
-profile[, .(isin  = sum(nzchar(isin)),
-            cik   = sum(nzchar(cik)),
-            cusip = sum(nzchar(cusip)))]
-profile_cols = c("symbol", "isin", "isEtf", "isFund", "companyName", "currency",
-                 "exchange", "country", "sector", "industry")
-profile_meta = profile[, ..profile_cols]
-pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
-setnames(pairs_combo, profile_cols[-1], c("isin1", "isetf1", "isfund1", "name1", "currency1", "exchange1", "country1",
-                                          "sector1", "industry1"))
-pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
-setnames(pairs_combo, profile_cols[-1], c("isin2","isetf2", "isfund2", "name2", "currency2", "exchange2", "country2",
-                                          "sector2", "industry2"))
+pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock1",
+                    by.y = "fmp_symbol", all.x = TRUE, all.y = FALSE)
+cols = colnames(profile_meta)[-1]
+setnames(pairs_combo, cols, paste0(cols, "1"))
+pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock2",
+                    by.y = "fmp_symbol", all.x = TRUE, all.y = FALSE)
+setnames(pairs_combo, cols, paste0(cols, "2"))
 
 # Save
 fwrite(pairs_combo, file.path(PATH_SAVE, "pairs_combo.csv"))
-
-# Summary
-pairs_combo[, sum(same_industry == 1) / nrow(pairs_combo) * 100]
-
-# Save best
-cols = colnames(pairs_combo)[grepl("^\\d+$", colnames(pairs_combo))]
-cols = c("stock1", "stock2", cols)
-best = pairs_combo[
-  # same_industry == 1 &
-  same_sector == 1 &
-    isfund1 == FALSE & isfund2 == FALSE &
-    isetf1 == FALSE & isetf2 == FALSE &
-    # country1 == country2 &
-    name1 != name2 & isin1 != isin2, ..cols]
-na.omit(best, cols = c("202475"))[order(-`202475`)] # Test
-na.omit(best, cols = c("202500"))[order(-`202500`)] # Test
-best = melt(best, id.vars = c("stock1", "stock2"))
-best = na.omit(best)
-best[1, as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
-best[, q := as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
-best[, variable := NULL]
-setorder(best, q, -value)
-
-# Save best
-fwrite(best, file.path(PATH_SAVE, "pairs_best_q.csv"))
-
-# Save to Azure
-bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
-                               Sys.getenv("BLOB-KEY"))
-cont = storage_container(bl_endp_key, "qc-backtest")
-storage_write_csv(as.data.frame(best), cont, "pairs_best_q.csv")
-
-# Checks
-best[stock1 == "PAA" & stock2 == "PAGP"]
-best[stock1 == "BEP" & stock2 == "BEPC"]
-best[stock1 == "MCO" & stock2 == "SPGI"]
-best[stock1 == "ASB" & stock2 == "HBAN"]
-best[stock1 == "KNX" & stock2 == "WERN"]
-best[stock1 == "LADR" & stock2 == "RITM"]
-
-
-
-# DEEP ANALYSE ------------------------------------------------------------
-# Check best
-best_ = merge(best, pairs_combo[, .(stock1, stock2, exchange1, exchange2,
-                                    country1, country2, currency1, currency2,
-                                    same_sector)],
-              by = c("stock1", "stock2"), all.x = TRUE, all.y = FALSE)
-best_ = merge(best_, profile_sample,
-              by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
-setnames(best_, c("sector", "industry"), c("sector1", "industry1"))
-best_ = merge(best_, profile_sample,
-              by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
-setnames(best_, c("sector", "industry"), c("sector2", "industry2"))
-
-

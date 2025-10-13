@@ -1,0 +1,4930 @@
+fd4234a180c1006b6f4fa947134ba138142241df MislavSag Tue Sep 30 14:45:12 2025 +0200 v 2025
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 91b7599..f89d98f 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -123,3 +123,6 @@ dir_ = "output_pci"
+ if (!dir.exists(dir_)) dir.create(dir_)
+ file_name = file.path("output_pci", paste0(i, ".csv"))
+ fwrite(pci_tests, file_name)
++
++
++
+diff --git a/fundamental_clustering.R b/fundamental_clustering.R
+new file mode 100644
+index 0000000..f8b5a33
+--- /dev/null
++++ b/fundamental_clustering.R
+@@ -0,0 +1,982 @@
++# library(arrow)
++# library(data.table)
++# library(ggplot2)
++# library(patchwork)
++# library(qlcal)
++# library(DescTools)
++# library(mlr3finance)
++# library(mlr3pipelines)
++# library(PerformanceAnalytics)
++# library(lubridate)
++# library(AzureStor)
++
++# library(mlr3cluster)
++# library(mlr3viz)
++# library(mlr3)
++# library(lubridate)
++# library(findata)
++# library(cluster)
++# library(RANN)
++
++
++
++# SET UP ------------------------------------------------------------------
++# set calendar
++qlcal::setCalendar("UnitedStates/NYSE")
++
++# Paths
++URIFACTORS = "F:/data/equity/us/predictors_daily/factors"
++list.files(URIFACTORS)
++
++
++# PREDICTORS ---------------------------------------------------------------
++# import factors
++fundamentals = read_parquet(file.path(URIFACTORS, "fundamental_factors.parquet"))
++cols = names(open_dataset(file.path(URIFACTORS, "prices_factors.parquet")))
++prices = read_parquet(
++  file.path(URIFACTORS, "prices_factors.parquet"),
++  col_select = c("symbol", "date", "open", "close", "close_raw", "volume", "returns"))
++macros = read_parquet(file.path(URIFACTORS, "macro_factors.parquet"))
++
++# filter dates and symbols
++# prices_dt <- price_factors[symbol %in% sp500_symbols]
++prices = unique(prices, by = c("symbol", "date"))
++
++# change date to data.table date
++prices[, date := data.table::as.IDate(date)]
++
++# order data
++setkey(prices, symbol)
++setorder(prices, "symbol", "date")
++
++# remove symbols with less than 4 years of data
++prices_n = prices[, .N, by = symbol]
++prices_n = prices_n[which(prices_n$N > 252*4)]  # remove prices with only 700 or less observations
++prices = prices[.(prices_n$symbol)]
++
++# remove missing values
++prices = na.omit(prices, cols = c("symbol", "date", "open", "close", "volume", "returns"))
++
++# create year month id column
++prices[, month := data.table::yearmon(date)]
++prices[, .(date, month)]
++
++
++# PREPARE DATA ------------------------------------------------------------
++# downsample market data by lowering frequency to one month
++dtm = prices[, .(
++  date = data.table::last(date),
++  open = data.table::first(open),
++  close = data.table::last(close),
++  close_raw = data.table::last(close_raw),
++  volume = sum(volume, na.rm = TRUE)
++), by = c("symbol", "month")]
++setorder(dtm, symbol, date)
++
++# Keep tradable
++dtm = dtm[close_raw > 5]
++dtm = dtm[volume > 500000]
++
++# generate predictors
++mom_size = 1:48
++mom_cls = paste0("mom", mom_size, "m")
++dtm[, .(symbol, date, close)]
++dtm[, (mom_cls) := lapply(mom_size, function(x) close / shift(close, x) - 1), by = symbol]
++dtm[, .(symbol, date, close, mom1m)]
++
++# generate target - month return
++dtm[, momret := close / open - 1]
++dtm[, momret := shift(momret, 1, type = "lag"), by = symbol]
++dtm[, .(symbol, date, mom1m, momret)]
++
++# clean fundamentals
++fundamentals = fundamentals[date > as.Date("2000-01-01")]
++fundamentals[, acceptedDateFundamentals := acceptedDate]
++setnames(fundamentals, "date", "fundamental_date")
++fundamentals = unique(fundamentals, by = c("symbol", "acceptedDate"))
++
++# merge price factors and fundamental data
++dtm[, date_ := date]
++fundamentals[, acceptedDate := as.IDate(acceptedDate)]
++firms = fundamentals[dtm, , on = c("symbol", "acceptedDate" = "date_"), roll = Inf]
++firms[, .(symbol, fundamental_date, date)]
++firms[, `:=`(acceptedDateFundamentals = NULL, rd = NULL, lgr = NULL, pchdepr = NULL)]
++setorder(firms, symbol, date)
++
++
++# PRERPCESSING ------------------------------------------------------------
++# # choose matching predictors
++id_cols = c("symbol", "month", "momret")
++predictors = colnames(firms)[c(9:ncol(firms))]
++predictors = c(predictors, mom_cls)
++predictors = setdiff(predictors,
++                     c("acceptedDateTime", "month", "date",
++                       "industry", "sector","open", "high", "low", "close",
++                       "volume", "close_raw", "returns"))
++predictors = unique(predictors)
++
++# merge predictors and firms
++cols = c(id_cols, predictors)
++X = firms[, ..cols]
++dim(X)
++# X[, date := as.POSIXct(date, tz = "UTC")]
++
++# remove columns with many NA
++keep_cols = names(which(colMeans(!is.na(X)) > 0.7)) # DONT DELETE MOM
++print(paste0("Removing columns with many NA values: ", setdiff(colnames(X), c(keep_cols, "right_time"))))
++X = X[, .SD, .SDcols = keep_cols]
++
++# Remove Inf and Nan values if they exists
++is.infinite.data.frame <- function(x) do.call(cbind, lapply(x, is.infinite))
++keep_cols <- names(which(colMeans(!is.infinite(as.data.frame(X))) > 0.95))
++print(paste0("Removing columns with Inf values: ", setdiff(colnames(X), keep_cols)))
++X = X[, .SD, .SDcols = keep_cols]
++
++# Number of variables by month
++g1 = X[, .N, by = month][order(month)] |>
++  ggplot(aes(x = month, y = N)) +
++  geom_line() +
++  labs(title = "Number of variables by month",
++       x = "Month", y = "Number of variables") +
++  theme_minimal()
++g2 = na.omit(X)[, .N, by = month][order(month)] |>
++  ggplot(aes(x = month, y = N)) +
++  geom_line() +
++  labs(title = "Number of variables by month",
++       x = "Month", y = "Number of variables") +
++  theme_minimal()
++g1 / g2
++
++# remove NA and Inf values
++X = na.omit(X)
++noninf_cols = which(is.finite(rowSums(X[, 3:ncol(X)])))
++X = X[noninf_cols]
++
++# Number of observations
++X[, .N, by = month][order(month)] |>
++  ggplot(aes(x = month, y = N)) +
++  geom_line() +
++  labs(title = "Number of variables by month",
++       x = "Month", y = "Number of variables") +
++  theme_minimal()
++
++# define feature columns
++predictors = colnames(X)[colnames(X) %in% predictors]
++
++# remove constant columns
++constant_cols = X[, lapply(.SD, function(x) var(x, na.rm=TRUE) == 0), by = month, .SDcols = predictors]
++constant_cols = colnames(constant_cols)[constant_cols[, sapply(.SD, function(x) any(x == TRUE))]]
++print(paste0("Removing feature with 0 standard deviation: ", constant_cols))
++predictors = setdiff(predictors, constant_cols)
++
++# winsorize
++X[, (predictors) := lapply(.SD, function(x) {
++  Winsorize(x, val = quantile(x, probs = c(0.01, 0.99), na.rm = TRUE))
++}), .SDcols = predictors, by = month]
++
++# remove constant columns
++constant_cols = X[, lapply(.SD, function(x) var(x, na.rm=TRUE) == 0), by = month, .SDcols = predictors]
++constant_cols = colnames(constant_cols)[constant_cols[, sapply(.SD, function(x) any(x == TRUE))]]
++print(paste0("Removing feature with 0 standard deviation: ", constant_cols))
++predictors = setdiff(predictors, constant_cols)
++
++# remove highly correlated features
++cor_mat = mlr3misc::invoke(stats::cor, x = X[, ..predictors])
++cor_abs = abs(cor_mat)
++cor_abs[upper.tri(cor_abs)] = 0
++diag(cor_abs) = 0
++to_remove = integer(0)
++cutoff_ = 0.98
++for (i in seq_len(ncol(cor_abs))) {
++  # i = 15
++  # print(i)
++  # If this column is already marked for removal, skip
++  if (i %in% to_remove) next
++
++  # Find columns correlated above the threshold with column i
++  high_cor_with_i = which(cor_abs[, i] > cutoff_)
++
++  if (length(high_cor_with_i) != 0) print(i)
++
++  # Mark those columns (except i itself) for removal
++  for (j in high_cor_with_i) {
++    if (!(j %in% to_remove) && j != i) {
++      to_remove = c(to_remove, j)
++    }
++  }
++}
++to_remove = unique(to_remove)
++keep_idx = setdiff(seq_len(ncol(X[, ..predictors])), to_remove)
++predictors = colnames(X[, ..predictors])[keep_idx]
++
++# get final preprocessed X
++cols_final = c(id_cols, predictors)
++X = X[, ..cols_final]
++
++
++# PCA ---------------------------------------------------------------------
++panel_pca = X[month > 2015, .(symbol = list(symbol),
++                  pca = list(prcomp(as.data.frame(.SD), scale. = TRUE))),
++              by = month, .SDcols = predictors]
++
++# join rotated data and permno
++panel_pca[, pca_predictors := mapply(function(x, y)
++  list(cbind.data.frame(symbol = x, y)),
++  panel_pca[, symbol], lapply(panel_pca[, pca], `[[`, "x"))
++]
++panel_pca[1, pca_predictors]
++
++# get cumulative proportions results
++get_cumulative_proportion = function(x, var_explained = 0.99) {
++  cumulative_proportion <- cumsum(x$sdev^2) / sum(x$sdev^2)
++  return(which(cumulative_proportion >= var_explained)[1])
++}
++panel_pca[, n_over_99 := lapply(pca, function(x) get_cumulative_proportion(x))]
++panel_pca[, n_over_95 := lapply(pca, function(x) get_cumulative_proportion(x, 0.95))]
++panel_pca[, n_over_90 := lapply(pca, function(x) get_cumulative_proportion(x, 0.90))]
++
++# remove low pca
++setorder(panel_pca, month)
++panel_pca = panel_pca[n_over_99 > 10]
++
++
++# # K-MEANS -----------------------------------------------------------------
++# parameters
++alpha = 50
++K = c(5,10,50, 100, 500, 1000,1500)
++
++# select number of components that explains 99% of variance
++panel_pca[, pca_99 := mapply(function(x, y) x[, 1:(y+1)],
++                             panel_pca[, pca_predictors],
++                             panel_pca[, n_over_99])]
++
++# define largest K
++f = function(x) K[K < nrow(x)]
++panel_pca[, K_max := lapply(pca_99, f)]
++panel_pca[, K_max]
++
++# kkmeans estimation function
++kkmeans_stimation = function(pca_xx, k = 5) {
++
++  # debug
++  # pca_xx = panel_pca[1, pca_99]
++
++  # extract predictors from pca object
++  pca_xx = pca_xx[[1]]
++  pca_xx = pca_xx[, 2:ncol(pca_xx)]
++
++  # create KMeans model
++  km = stats::kmeans(pca_xx,
++                     centers = k,
++                     iter.max = 1000,
++                     nstart = 5,
++                     algorithm = "Lloyd")
++
++  # calculate nearest neighbor distance
++  dist  = FNN::get.knn(pca_xx, k = 2)
++
++  # get alpha quantile of neigboring distances
++  distance_of_percentile_to_nearest_neighbors = median(dist$nn.dist[, 2])
++
++  # get the cluster size
++  size = length(km$size)
++
++  # calculate distances to centroide of belonging_cluster for every data point
++  centers <- km$centers[km$cluster, ]
++  distances <- sqrt(rowSums((pca_xx - centers)^2))
++
++  # outliers
++  outliers = distances > distance_of_percentile_to_nearest_neighbors
++  # sum(outliers) / length(outliers)
++
++  # merge data, clusters and outliers
++  list(cbind.data.frame(cluster = km$cluster, outliers = outliers))
++}
++
++# generate kmeans clusters
++panel_pca[, kk_5 := list(kkmeans_stimation(pca_99, 5)), by = month]
++panel_pca[, kk_10 := list(kkmeans_stimation(pca_99, 10)), by = month]
++panel_pca[, kk_50 := list(kkmeans_stimation(pca_99, 50)), by = month]
++panel_pca[, kk_500 := list(kkmeans_stimation(pca_99, 500)), by = month]
++
++
++# CREATE PAIRS ------------------------------------------------------------
++# Preparing all data for trading in one table
++dt_trading = X[, .(month, symbol, momret, mom1m)]
++kmeans_clusters = panel_pca[, cbind(symbol = unlist(symbol), rbindlist(kk_50)), by = month]
++dt_trading = merge(dt_trading, kmeans_clusters, by = c("symbol", "month"), all.x = TRUE, all.y = FALSE)
++dt_trading = na.omit(dt_trading)
++setorder(dt_trading, month)
++
++# remove outliers
++dt_trading = dt_trading[outliers == FALSE]
++
++# order from largest to lowst mom1m
++setorderv(dt_trading, c("month", "cluster", "mom1m"), order = -1)
++
++# calclualte mom1m diference between all pairs
++dt_trading[, mom1m_diff := unlist(lapply(0:(length(mom1m) - 1), function(x)
++  mom1m[x + 1] - mom1m[length(mom1m) - x])),
++  by = c("month", "cluster")]
++dt_trading[, mom1m_diff_sd := sd(mom1m_diff), by = c("month")] # by = c("date", "cluster")
++
++# filter pairs above threshold
++universe = dt_trading[abs(mom1m_diff) > mom1m_diff_sd]
++setorder(universe, month, cluster, -mom1m)
++universe[, .N, by = c("month", "cluster")]
++
++# create pairs data table
++pairs = universe[, `:=`(pair_short = symbol,
++                        pair_long = rev(symbol),
++                        momret_short = momret,
++                        momret_long = rev(momret)), by = c("month", "cluster")]
++pairs = pairs[mom1m_diff > 0]
++pairs[month == 2025 & cluster == 8,
++      .(month, symbol, pair_short, pair_long, momret_short, momret_long)]
++
++# inspect pairs
++pairs[, .N, c("month", "cluster")]
++
++# cumulative returns by date
++returns_long = pairs[, .(cum_return = sum(momret_long * (1 / length(momret_long)))), by = "month"]
++returns_short = pairs[, .(cum_return = sum(-momret_short * (1 / length(momret_short)))), by = "month"]
++
++# performance by dates
++returns_long[, mean(cum_return), by = "month"]
++returns_short[, mean(cum_return), by = "month"]
++returns_long[, median(cum_return), by = "month"]
++returns_short[, median(cum_return), by = "month"]
++
++# Equity curve
++portfolio = as.xts.data.table(returns_long[, .(zoo::as.Date.yearmon(month), cum_return)])
++charts.PerformanceSummary(portfolio, main = "Long Pairs")
++charts.PerformanceSummary(portfolio["2020/"], main = "Long Pairs")
++
++
++# SAVE FOR QC BACKTEST ----------------------------------------------------
++# extract dtaa for best clustering method
++pairs_qc = pairs[, .(month, pair_short, pair_long)]
++pairs_qc = pairs_qc[, .(pairs_short = paste0(pair_short, collapse = "|"),
++                        pairs_long = paste0(pair_long, collapse = "|")),
++                    by = month]
++pairs_qc[, month := as.Date(zoo::as.yearmon(month))]
++pairs_qc[, month := ceiling_date(month, "month") - 1]
++setorder(pairs_qc, "month")
++# seq_date = data.table(month = seq.Date(min(pairs_qc$month), max(pairs_qc$year_month_id), by = 1))
++# pairs_qc = pairs_qc[seq_date, on = "month", roll = Inf]
++pairs_qc[, year_month_id := as.character(month)]
++pairs_qc = pairs_qc[month >= as.Date("2020-01-01")]
++pairs_qc[, month := as.Date(vapply(month, advanceDate, FUN.VALUE = Date(1L)))]
++endpoint = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                            key=Sys.getenv("BLOB-KEY"))
++cont = storage_container(endpoint, "qc-backtest")
++storage_write_csv(pairs_qc, cont, "fundamental_stat_arb.csv", col_names = FALSE)
++
++# Compare QC and local
++pairs_qc[, unique(month)]
++head(pairs_qc)
++
++
++
++# # PREDICTORS VLADO --------------------------------------------------------
++# # import data set
++# df = fread("C:/Users/Mislav/Documents/GitHub/Pairs-Trading-via-Unsupervised-Learning/datashare.csv")
++#
++# # filter dates
++# df_radni = df[between(DATE, 19751231, 20220101, incbounds = FALSE)]
++#
++# # choose columns
++# cols = c(
++#   'DATE','permno','mom1m','sic2','absacc','acc','aeavol','age','agr','baspread',
++#   'beta','betasq','bm','bm_ia','cash','cashdebt','cashpr','cfp','cfp_ia',
++#   'chatoia','chcsho','chempia','chinv','chmom','chpmia','chtx','cinvest',
++#   'convind','currat','depr','divi','divo','dolvol','dy','ear','egr','ep',
++#   'gma','herf','hire','idiovol','ill','indmom','invest','lev','lgr','maxret',
++#   'ms','mve_ia','mvel1','nincr','operprof','pchcapx_ia','pchcurrat','pchdepr',
++#   'pchgm_pchsale','pchquick','pchsale_pchrect','pctacc','pricedelay',
++#   'ps','quick','rd','retvol','roaq','roeq','roic','rsup','salecash',
++#   'salerec','securedind','sgr','sin','sp','std_dolvol','std_turn',
++#   'tang','tb','turn','zerotrade'
++# )
++# df_radni = df_radni[, ..cols] # Vlado (3579135, 80) -> SAME
++#
++# # feture names
++# feature_names_list = c('mom1m','absacc','acc','aeavol','age','agr','baspread',
++#                        'beta','betasq','bm','bm_ia','cash','cashdebt','cashpr','cfp','cfp_ia',
++#                        'chatoia','chcsho','chempia','chinv','chmom','chpmia','chtx','cinvest',
++#                        'convind','currat','depr','divi','divo','dolvol','dy','ear','egr','ep',
++#                        'gma','herf','hire','idiovol','ill','indmom','invest','lev','lgr','maxret',
++#                        'ms','mve_ia','mvel1','nincr','operprof','pchcapx_ia','pchcurrat','pchdepr',
++#                        'pchgm_pchsale','pchquick','pchsale_pchrect','pctacc','pricedelay',
++#                        'ps','quick','rd','retvol','roaq','roeq','roic','rsup','salecash',
++#                        'salerec','securedind','sgr','sin','sp','std_dolvol','std_turn',
++#                        'tang','tb','turn','zerotrade')
++# mom_names_list = c("mom1m","mom2m","mom3m","mom4m","mom5m","mom6m","mom7m","mom8m","mom9m","mom10m","mom11m","mom12m",
++#                    "mom13m","mom14m","mom15m","mom16m","mom17m","mom18m","mom19m","mom20m","mom21m","mom22m","mom23m","mom24m",
++#                    "mom25m","mom26m","mom27m","mom28m","mom29m","mom30m","mom31m","mom32m","mom33m","mom34m","mom35m","mom36m",
++#                    "mom37m","mom38m","mom39m","mom40m","mom41m","mom42m","mom43m","mom44m","mom45m","mom46m","mom47m","mom48m")
++# feature_names_list_full = c(feature_names_list, mom_names_list)
++#
++#
++#
++# ######### RIGHT WAY ###########
++# # parameters
++# max_number_of_nulls_in_observation = 2
++#
++# # remove nas by n NA's in rows
++# delete_na <- function(DT, n=0) {
++#   DT[rowSums(is.na(DT)) <= n]
++# }
++#
++# # calucalte mom features and remove features with more than 2 NA's in features
++# start_time = Sys.time()
++# panel = as.data.table(expand.grid(permno = df_radni[, unique(permno)],
++#                                   DATE = df_radni[, unique(DATE)]))
++# panel = df_radni[panel, on = c("permno", "DATE")]
++# mom_size = 2:48
++# mom_cols = paste0("mom", mom_size, "m")
++# setorder(panel, permno, DATE)
++# panel[permno == 10006, .(DATE, mom1m)][1:100]
++# duplicated(panel[permno == 10006, .(DATE)])
++# setorder(panel, permno, DATE)
++# panel[, (mom_cols) := frollapply(shift(mom1m, 1), n = mom_size-1,
++#                                  function(y) prod(1+y)-1),
++#       by = permno]
++# end_time = Sys.time()
++# end_time - start_time
++#
++# # check permno na.permno == 10006
++# panel_2 = na.omit(panel, cols = c("mom1m", mom_cols))
++# panel_2 = panel_2[rowSums(is.na(panel_2[, ..feature_names_list])) <= 2]
++# nrow(panel_2)
++#
++# # impute missing values with median
++# cols = c(feature_names_list, mom_names_list)
++# panel_2[, (cols) := lapply(.SD, function(x){
++#   fifelse(is.na(x), median(x, na.rm = TRUE), x)
++# }), .SDcols = cols, by = "DATE"]
++# setorderv(panel_2, c("permno", "DATE"))
++#
++# # compare
++# dim(panel_2)
++#
++# # check for constant columns for every date
++# constant_columns = panel_2[, lapply(.SD, function(x) var(x) == 0), by = DATE]
++# constant_columns_subset <- constant_columns[, .SD,
++#                                             .SDcols = which(sapply(constant_columns, function(x) any(x == TRUE)))]
++#
++# # temporarily solution - remove salerec column because it is constant across some dates
++# panel_2[, colnames(constant_columns_subset) := NULL]
++# festures_remove = c("sic2", colnames(constant_columns_subset))
++# feature_names_list_full = setdiff(feature_names_list_full, festures_remove)
++#
++# # aplly PCA
++# panel_pca = panel_2[, .(permno = list(permno),
++#                         pca = list(prcomp(as.data.frame(.SD), scale. = TRUE))),
++#                     by = DATE, .SDcols = feature_names_list_full]
++#
++# # join rotated data and permno
++# # test = mapply(function(x, y) list(cbind(permno = x, y)), panel_pca[1:2, permno], lapply(panel_pca[1:2, pca], `[[`, "x"))
++# # test = copy(panel_pca[1:2])
++# # test[, pca_predictors := mapply(function(x, y) list(cbind(permno = x, y)),
++# #                                       panel_pca[1:2, permno], lapply(panel_pca[1:2, pca], `[[`, "x"))]
++# panel_pca[, pca_predictors := mapply(function(x, y) list(cbind(permno = x, y)),
++#                                      panel_pca[, permno], lapply(panel_pca[, pca], `[[`, "x"))]
++# panel_pca[1, pca_predictors]
++#
++# # get cumulative proportions results
++# # panel_pca[1:2, lapply(pca, function(x) get_cumulative_proportion(x))]
++# get_cumulative_proportion = function(x, var_explained = 0.99) {
++#   cumulative_proportion <- cumsum(x$sdev^2 / sum(x$sdev^2))
++#   return(which(cumulative_proportion >= var_explained)[1])
++# }
++# panel_pca[, n_over_99 := lapply(pca, function(x) get_cumulative_proportion(x))]
++# panel_pca[, n_over_95 := lapply(pca, function(x) get_cumulative_proportion(x, 0.95))]
++# panel_pca[, n_over_90 := lapply(pca, function(x) get_cumulative_proportion(x, 0.90))]
++#
++#
++#
++# # K-MEANS -----------------------------------------------------------------
++# # parameters
++# alpha = 50
++# K = c(5,10,50, 100, 500, 1000,1500)
++#
++# # select number of components that explains 99% of variance
++# panel_pca[, pca_99 := mapply(function(x, y) x[, 1:(y+1)],
++#                              panel_pca[, pca_predictors],
++#                              panel_pca[, n_over_99])]
++#
++# # define largest K
++# f = function(x) K[K < nrow(x)]
++# panel_pca[, K_max := lapply(pca_99, f)]
++# panel_pca[, K_max]
++#
++# # kkmeans estimation function
++# kkmeans_stimation = function(pca_xx, k = 5) {
++#
++#   # debug
++#   # pca_xx = panel_pca[1, pca_99]
++#
++#   # extract predictors from pca object
++#   pca_xx = pca_xx[[1]]
++#   pca_xx = pca_xx[, 2:ncol(pca_xx)]
++#
++#   # create KMeans model
++#   km = stats::kmeans(pca_xx,
++#                      centers = k,
++#                      iter.max = 1000,
++#                      nstart = 5,
++#                      algorithm = "Lloyd")
++#
++#   # calculate nearest neighbor distance
++#   dist  = FNN::get.knn(pca_xx, k = 2)
++#
++#   # get alpha quantile of neigboring distances
++#   distance_of_percentile_to_nearest_neighbors = median(dist$nn.dist[, 2])
++#
++#   # get the cluster size
++#   size = length(km$size)
++#
++#   # calculate distances to centroide of belonging_cluster for every data point
++#   centers <- km$centers[km$cluster, ]
++#   distances <- sqrt(rowSums((pca_xx - centers)^2))
++#
++#   # outliers
++#   outliers = distances > distance_of_percentile_to_nearest_neighbors
++#   # sum(outliers) / length(outliers)
++#
++#   # merge data, clusters and outliers
++#   list(cbind.data.frame(cluster = km$cluster, outliers = outliers))
++# }
++#
++# # generate kmeans clusters
++# # panel_pca[, kk_5 := list(kkmeans_stimation(pca_99, 5)), by = DATE]
++# # panel_pca[, kk_10 := list(kkmeans_stimation(pca_99, 10)), by = DATE]
++# # panel_pca[, kk_50 := list(kkmeans_stimation(pca_99, 50)), by = DATE]
++# # panel_pca[, kk_100 := list(kkmeans_stimation(pca_99, 100)), by = DATE]
++# panel_pca[, kk_500 := list(kkmeans_stimation(pca_99, 500)), by = DATE]
++#
++#
++#
++# # TRADING -----------------------------------------------------------------
++# # Preparing all data for trading in one table
++# df_data_for_trading = panel[, .(DATE, permno, mom1m)]
++# setnames(df_data_for_trading, "mom1m", "rt-1")
++# setorder(df_data_for_trading, permno, DATE)
++# df_data_for_trading[, rt := shift(`rt-1`, type = "lead"), by = .(permno)]
++# kmeans_clusters = panel_pca[, cbind(permno = unlist(permno), rbindlist(kk_500)), by = DATE]
++# df_data_for_trading = merge(df_data_for_trading, kmeans_clusters, by = c("permno", "DATE"), all.x = TRUE, all.y = FALSE)
++# df_data_for_trading = na.omit(df_data_for_trading)
++# df_data_for_trading = df_data_for_trading[DATE %between% c(19800131, 20201231)]
++# setorder(df_data_for_trading, DATE)
++#
++#
++# # date window
++# date = 19800131
++# df_data_for_trading_window = df_data_for_trading[DATE == date]
++# KMeans_unique_clusters_for_date = df_data_for_trading_window[, unique(cluster)]
++# table(df_data_for_trading_window[, cluster])
++# df_data_for_trading_window[, .N, by = cluster][order(N)]
++
++
++
++# DAILY MARKET DATA -------------------------------------------------------
++# # import market data (choose frequency)
++# arr <- tiledb_array("D:/equity-usa-daily-fmp",
++#                     as.data.frame = TRUE,
++#                     query_layout = "UNORDERED",
++#                     selected_ranges = list(symbol = cbind(sp500_symbols, sp500_symbols))
++# )
++# system.time(prices <- arr[])
++# tiledb_array_close(arr)
++# prices <- as.data.table(prices)
++#
++# # remove duplicates
++# prices_dt <- unique(prices, by = c("symbol", "date"))
++#
++# # change date to data.table date
++# prices_dt[, date := data.table::as.IDate(date)]
++
++# # keep only NYSE trading days
++# trading_days <- getBusinessDays(prices_dt[, min(date)], prices_dt[, max(date)])
++# setkey(prices_dt, date)
++# prices_dt <- prices_dt[.(as.IDate(trading_days))]
++# setkey(prices_dt, NULL)
++#
++# # remove observations with measurement errors
++# prices_dt <- prices_dt[open > 0 & high > 0 & low > 0 & close > 0 & adjClose > 0] # remove rows with zero and negative prices
++#
++# # order data
++# setorder(prices_dt, "symbol", "date")
++#
++# # adjuset all prices, not just close
++# prices_dt[, returns := adjClose / shift(adjClose) - 1, by = symbol] # calculate returns
++# prices_dt <- prices_dt[returns < 1] # TODO:: better outlier detection mechanism. For now, remove daily returns above 100%
++# adjust_cols <- c("open", "high", "low")
++# prices_dt[, (adjust_cols) := lapply(.SD, function(x) x * (adjClose / close)), .SDcols = adjust_cols] # adjust open, high and low prices
++# prices_dt[, close := adjClose]
++#
++# # remove missing values
++# prices_dt <- na.omit(prices_dt[, .(symbol, date, open, high, low, close, volume, returns)])
++#
++# # remove symobls with < 252 observations
++# prices_n <- prices_dt[, .N, by = symbol]
++# prices_n <- prices_n[N > 252]  # remove prices with only 700 or less observations
++# prices_dt <- prices_dt[symbol %in% prices_n[, symbol]]
++#
++#
++# # save SPY for later and keep only events symbols
++# spy <- prices_dt[symbol == "SPY"]
++# setorder(spy, date)
++
++
++
++# # FUNDAMENTAL DATA --------------------------------------------------------
++# # tiledb urls
++# uri_pl = "s3://equity-usa-income-statement-bulk"
++# uri_bs = "s3://equity-usa-balance-sheet-statement-bulk"
++# uri_fg = "s3://equity-usa-financial-growth-bulk"
++# uri_metrics = "s3://equity-usa-key-metrics-bulk"
++#
++# # income statement data
++# arr <- tiledb_array(uri_pl, as.data.frame = TRUE, query_layout = "UNORDERED",)
++# system.time(pl <- arr[])
++# tiledb_array_close(arr)
++# pl <- as.data.table(pl)
++# pl[, `:=`(acceptedDateTime = as.POSIXct(acceptedDate, format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York"),
++#           acceptedDate = as.Date(acceptedDate, format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York"))]
++#
++# # balance sheet data
++# arr <- tiledb_array(uri_bs, as.data.frame = TRUE, query_layout = "UNORDERED")
++# system.time(bs <- arr[])
++# tiledb_array_close(arr)
++# bs <- as.data.table(bs)
++# bs[, `:=`(acceptedDateTime = as.POSIXct(acceptedDate, format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York"),
++#           acceptedDate = as.Date(acceptedDate, format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York"))]
++#
++# # financial growth
++# arr <- tiledb_array(uri_fg, as.data.frame = TRUE, query_layout = "UNORDERED")
++# system.time(fin_growth <- arr[])
++# tiledb_array_close(arr)
++# fin_growth <- as.data.table(fin_growth)
++#
++# # financial ratios
++# arr <- tiledb_array(uri_metrics, as.data.frame = TRUE, query_layout = "UNORDERED")
++# system.time(fin_ratios <- arr[])
++# tiledb_array_close(arr)
++# fin_ratios <- as.data.table(fin_ratios)
++#
++# # merge all fundamental data
++# columns_diff_pl <- c("symbol", "date", setdiff(colnames(pl), colnames(bs)))
++# columns_diff_fg <- c("symbol", "date", setdiff(colnames(fin_growth), colnames(pl)))
++# columns_diff_fr <- c("symbol", "date", setdiff(colnames(fin_ratios), colnames(pl)))
++# fundamentals <- Reduce(function(x, y) merge(x, y, by = c("symbol", "date"), all.x = TRUE, all.y = FALSE),
++#                        list(bs,
++#                             pl[, ..columns_diff_pl],
++#                             fin_growth[, ..columns_diff_fg],
++#                             fin_ratios[, ..columns_diff_fr]))
++
++
++
++# X -----------------------------------------------------------------------
++# choose matching predictors
++id_cols = c("symbol", "month", "momret")
++predictors = colnames(firms)[108:ncol(firms)]
++predictors = c(predictors, mom_cls)
++predictors = setdiff(predictors,
++                     c("acceptedDateTime", "month", "date",
++                       "industry", "sector","open", "high", "low", "close",
++                       "volume", "close_raw", "returns"))
++predictors = unique(predictors)
++
++# merge predictors and firms
++cols = c(id_cols, predictors)
++X = firms[, ..cols]
++dim(X)
++
++# remove columns with many NA
++keep_cols <- names(which(colMeans(!is.na(X)) > 0.80))
++print(paste0("Removing columns with many NA values: ", setdiff(colnames(X), c(keep_cols, "right_time"))))
++X <- X[, .SD, .SDcols = keep_cols]
++
++# remove Inf and Nan values if they exists
++is.infinite.data.frame <- function(x) do.call(cbind, lapply(x, is.infinite))
++keep_cols <- names(which(colMeans(!is.infinite(as.data.frame(X))) > 0.99))
++print(paste0("Removing columns with Inf values: ", setdiff(colnames(X), keep_cols)))
++X = X[, .SD, .SDcols = keep_cols]
++
++# prepare data for clustering
++X = na.omit(X)
++
++# define feature columns
++predictors = colnames(X)[colnames(X) %in% predictors]
++
++# Winsorize
++X[, (predictors) := lapply(.SD, function(x) {
++  Winsorize(x, val = quantile(x, probs = c(0.01, 0.99), na.rm = TRUE))
++}), .SDcols = predictors, by = month]
++
++# remove constant columns
++constant_cols = X[, lapply(.SD, function(x) var(x, na.rm=TRUE) == 0), by = month, .SDcols = predictors]
++constant_cols = colnames(constant_cols)[constant_cols[, sapply(.SD, function(x) any(x == TRUE))]]
++print(paste0("Removing feature with 0 standard deviation: ", constant_cols))
++predictors = setdiff(predictors, constant_cols)
++
++# remove highly correlated features
++cor_mat = mlr3misc::invoke(stats::cor, x = X[, ..predictors])
++cor_abs = abs(cor_mat)
++cor_abs[upper.tri(cor_abs)] = 0
++diag(cor_abs) = 0
++to_remove = integer(0)
++cutoff_ = 0.98
++for (i in seq_len(ncol(cor_abs))) {
++  # i = 15
++  # print(i)
++  # If this column is already marked for removal, skip
++  if (i %in% to_remove) next
++
++  # Find columns correlated above the threshold with column i
++  high_cor_with_i = which(cor_abs[, i] > cutoff_)
++
++  if (length(high_cor_with_i) != 0) print(i)
++
++  # Mark those columns (except i itself) for removal
++  for (j in high_cor_with_i) {
++    if (!(j %in% to_remove) && j != i) {
++      to_remove = c(to_remove, j)
++    }
++  }
++}
++to_remove = unique(to_remove)
++keep_idx = setdiff(seq_len(ncol(X[, ..predictors])), to_remove)
++predictors = colnames(X[, ..predictors])[keep_idx]
++
++# get final preprocessed X
++cols_final = c(id_cols, predictors)
++X = X[, ..cols_final]
++
++# Scale X
++# X = X[, (predictors) := lapply(.SD, scale), .SDcols = predictors]
++
++# PCA that explains 99% of variance
++pca <- prcomp(as.data.frame(X[, ..predictors]), scale = TRUE, center = TRUE)
++cumulative_proportion <- cumsum(pca$sdev^2 / sum(pca$sdev^2))
++n_components <- which(cumulative_proportion >= 0.99)[1]
++X_pca <- prcomp(as.data.frame(X[, ..feature_cols]), scale = FALSE, rank = n_components)
++cols_keep = c(id_cols, "mom1m")
++X_pca = cbind(X[, ..cols_keep], X_pca$x)
++
++# PCA ---------------------------------------------------------------------
++# REshape data
++panel_pca = X[month > 2015, .(symbol = list(symbol),
++                              pca = list(prcomp(as.data.frame(.SD), center = TRUE, scale. = TRUE))),
++              by = month, .SDcols = predictors]
++
++# join rotated data and permno
++panel_pca[, pca_predictors := mapply(function(x, y)
++  list(cbind.data.frame(symbol = x, y)),
++  panel_pca[, symbol], lapply(panel_pca[, pca], `[[`, "x"))
++]
++panel_pca[1, pca_predictors]
++
++# get cumulative proportions results
++get_cumulative_proportion = function(x, var_explained = 0.99) {
++  cumulative_proportion <- cumsum(x$sdev^2) / sum(x$sdev^2)
++  return(which(cumulative_proportion >= var_explained)[1])
++}
++panel_pca[, n_over_99 := lapply(pca, function(x) get_cumulative_proportion(x))]
++panel_pca[, n_over_95 := lapply(pca, function(x) get_cumulative_proportion(x, 0.95))]
++panel_pca[, n_over_90 := lapply(pca, function(x) get_cumulative_proportion(x, 0.90))]
++
++# remove low pca
++setorder(panel_pca, month)
++panel_pca = panel_pca[n_over_99 > 10]
++
++
++# MLR3 ESTIMATION ---------------------------------------------------------
++# create tasks for every month
++tasks = lapply(dates, function(d) {
++  task = as_task_clust(X_pca[as.IDate(date) == as.IDate(d)],
++                       id = paste0("Date ", d))
++  task$col_roles$feature = setdiff(task$col_roles$feature, cols_keep)
++  return(task)
++})
++
++# benchmark with various tasks
++design = benchmark_grid(
++  tasks = tasks,
++  learners = list(
++    lrn("clust.kmeans", centers = 5L, id = "kmeans_5"),
++    lrn("clust.kmeans", centers = 10L, id = "kmeans_10"),
++    lrn("clust.kmeans", centers = 50L, id = "kmeans_50")),
++  # lrn("clust.pam", k = 3L),
++  # lrn("clust.hclust"),
++  # lrn("clust.diana", k = 5L, id = "diana_5"),
++  # lrn("clust.diana", k = 10L, id = "diana_10"),
++  # lrn("clust.diana", k = 50L, id = "diana_50"),
++  #
++  # lrn("clust.agnes", k = 5L, id = "agnes_5"),
++  # lrn("clust.agnes", k = 10, id = "agnes_10"),
++  # lrn("clust.agnes", k = 50L, id = "agnes_50"),
++  # lrn("clust.cmeans", centers = 5L, id = "cmeans_5"),
++  # lrn("clust.cmeans", centers = 10L, id = "cmeans_10"),
++  # lrn("clust.cmeans", centers = 50L, id = "cmeans_50")),
++  resamplings = rsmp("insample"))
++bmrs = benchmark(design, store_models = TRUE)
++bmr_dt = as.data.table(bmrs)
++
++# get predictions for all tasks and learners
++tasks = bmr_dt$task
++task_names = vapply(tasks, function(x) x$id, FUN.VALUE = character(1))
++backs = lapply(tasks, function(x) {
++  x$backend$data(cols = c(cols_keep, x$feature_names),
++                 rows = 1:x$nrow)
++})
++names(backs) = task_names
++backs_dt = rbindlist(backs, idcol = "task_id")
++learners = bmr_dt$learner
++learner_names = vapply(learners, function(x) x$id, FUN.VALUE = character(1))
++predictions = bmr_dt$prediction
++names(predictions) = learner_names
++predictions_dt = lapply(predictions, as.data.table)
++predictions_dt = rbindlist(predictions_dt, idcol = "learner_id", fill = TRUE)
++predictions_dt = predictions_dt[, 1:3]
++
++# help col names
++cols_by = c("task_id", "learner_id")
++
++# merge predictions and backends
++clusters = cbind(backs_dt, predictions_dt)
++setorderv(clusters, c("task_id", "learner_id", "partition", "mom1m"), order = -1)
++
++# calclualte mom1m diference between all pairs
++clusters[, mom1m_diff := unlist(lapply(0:(length(mom1m) - 1), function(x) mom1m[x+1] - mom1m[length(mom1m)-x])),
++         by = c(cols_by, "partition")]
++clusters[, mom1m_diff_sd := sd(mom1m_diff), by = cols_by]
++
++
++
++# INDIVIDUAL ESTIMATION - AGGLOMERATIVE SLUSTERING ----------------------------
++# prepare data
++dt = copy(X_pca)
++predictors = setdiff(colnames(dt), c(id_cols, "mom1m"))
++
++# Specify alpha percentile for linkage distance
++alpha <- 0.1
++
++# Calculate l1 distance between nearest data points
++dist_matrix <- dist(dt[, ..predictors], method = "manhattan") # Calculate distance matrix
++min_dist <- min(dist(dist_matrix, method = "manhattan"))
++
++# Calculate linkage distance as alpha percentile of nearest data points distance
++linkage_distance <- alpha * min_dist
++
++# Perform agglomerative clustering with average linkage and specified linkage distance
++hclust_result <- hclust(dist_matrix, method = "average") # Perform hierarchical clustering with average linkage
++cut_dendrogram <- cutree(hclust_result, h = linkage_distance) # Cut dendrogram at specified linkage distance
++
++
++
++
++# REMOVE OUTLIERS ---------------------------------------------------------
++# identify outliers for kmeans clusters
++feature_names = tasks[[1]]$feature_names
++models = lapply(learners, `[[`, "model")
++models_dt = as.data.table(cbind.data.frame(task_names, learner_names))
++models_dt[, models := list(models)]
++
++# debug for kmeans
++data_ = tasks[[1]]$data()
++kmeans_model = bmr_dt[1]$learner[[1]]$model
++
++# util function to find nearest neighbour distance
++get_threshold_e = function(df, alpha = 0.5) {
++  nn_distances =  as.matrix(dist(df))
++  nn_distances = apply(nn_distances, 1, sort)
++  nn_distances = apply(nn_distances, 1, `[`, 2)
++  e = quantile(nn_distances, probs = alpha)
++  return(e)
++}
++
++# nearest neighbor distances
++e_thresholds_by_ids = clusters[, .(l2 = get_threshold_e(.SD)), .SDcols = feature_names, by = cols_by]
++e_thresholds_by_ids_kmeans = e_thresholds_by_ids[grep("kmeans", learner_id)]
++
++# calculate distance to centroid for kmeans clusters
++kmeans_index = grep("kmeans", vapply(bmr_dt[, learner], `[[`, "id", FUN.VALUE = character(1L)))
++centers = lapply(bmr_dt[, learner], function(x) x$model$centers)[kmeans_index]
++data_ = lapply(bmr_dt[, task], function(x) x$data())[kmeans_index]
++partritions = lapply(bmr_dt[, learner], function(x) length(x$model$size))[kmeans_index]
++centroid_distances = lapply(1:length(data_), function(i) {
++  x = head(as.matrix(dist(rbind(data_[[i]], centers[[i]]))), -partritions[[i]])
++  x = x[, ((ncol(x)-partritions[[i]]+1):ncol(x))]
++  as.data.table(x)
++  # return(as.vector(x))
++})
++centroid_distances[[1]]
++centroid_distances[[2]]
++outliers = lapply(seq_along(centroid_distances), function(i) {
++  apply(centroid_distances[[i]], 1, function(x) all(x > e_thresholds_by_ids_kmeans[i, l2]))
++})
++
++# add outliers to clusters object
++clusters[grep("kmeans", learner_id), outlier := unlist(outliers)]
++
++
++
++# CREATE PAIRS ------------------------------------------------------------
++# filter pairs above threshold
++universe = clusters[abs(mom1m_diff) > mom1m_diff_sd]
++universe[, .N, by = c(cols_by, "partition")]
++
++# create pairs data table
++pairs = universe[, `:=`(pair_short = symbol,
++                        pair_long = rev(symbol),
++                        momret_short = momret,
++                        momret_long = rev(momret)), by = c(cols_by, "partition")]
++pairs[task_id == "Date 2023-01-01" & partition == 3 & learner_id == "kmeans_50",
++      .(date, symbol, pair_short, pair_long, momret_short, momret_long)]
++pairs = pairs[mom1m_diff > 0]
++
++# remove outliers
++dim(pairs)
++pairs = pairs[outlier == FALSE]
++dim(pairs)
++
++# inspect pairs
++pairs[, .N, c(cols_by, "partition")]
++
++# cumulative returns ny tasks and partitions
++returns_long = pairs[, .(cum_return = prod(1+momret_long)-1), by = cols_by]
++returns_short = pairs[, .(cum_return = prod(1+(-momret_short)-1)), by = cols_by]
++
++# performance by dates
++returns_long[, mean(cum_return), by = "task_id"]
++returns_short[, mean(cum_return), by = "task_id"]
++returns_long[, median(cum_return), by = "task_id"]
++returns_short[, median(cum_return), by = "task_id"]
++
++# perfromance by learners
++returns_long[, mean(cum_return), by = "learner_id"]
++returns_short[, mean(cum_return), by = "learner_id"]
++returns_long[, median(cum_return), by = "learner_id"]
++returns_short[, median(cum_return), by = "learner_id"]
++
++
++
++# SAVE FOR QC BACKTEST ----------------------------------------------------
++# extract dtaa for best clustering method
++pairs_qc = pairs[learner_id == "kmeans_50"]
++pairs_qc = pairs_qc[, .(date, pair_short, pair_long)]
++pairs_qc = pairs_qc[, .(pairs_short = paste0(pair_short, collapse = "|"),
++                        pairs_long = paste0(pair_long, collapse = "|")),
++                    by = date]
++pairs_qc[, date := as.Date(date)]
++setorder(pairs_qc, "date")
++seq_date = data.table(date = seq.Date(min(pairs_qc$date), max(pairs_qc$date), by = 1))
++pairs_qc = pairs_qc[seq_date, on = "date", roll = Inf]
++pairs_qc[, date := as.character(date)]
++endpoint = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                            key=Sys.getenv("BLOB-KEY"))
++cont = storage_container(endpoint, "qc-backtest")
++storage_write_csv(pairs_qc, cont, "fundamental_stat_arb.csv", col_names = FALSE)
+diff --git a/fundamental_gausscov_clustering.R b/fundamental_gausscov_clustering.R
+new file mode 100644
+index 0000000..3803b56
+--- /dev/null
++++ b/fundamental_gausscov_clustering.R
+@@ -0,0 +1,18 @@
++library(data.table)
++
++
++# SET UP ------------------------------------------------------------------
++# set calendar
++qlcal::setCalendar("UnitedStates/NYSE")
++
++# Paths
++PREDICTORS_SAVE = "D:/strategies/statsarb"
++
++
++# DATA --------------------------------------------------------------------
++# Import predictors
++predictors = fread(file.path(PREDICTORS_SAVE, "predctors.csv"))
++format(object.size(predictors), unit = "auto")
++
++
++specFfm()
+diff --git a/paper_trading.R b/paper_trading.R
+new file mode 100644
+index 0000000..073f63f
+--- /dev/null
++++ b/paper_trading.R
+@@ -0,0 +1,228 @@
++library(fastverse)
++library(finutils)
++library(partialCI)
++library(xts)
++library(AzureStor)
++library(lubridate)
++library(ggplot2)
++library(patchwork)
++library(PerformanceAnalytics)
++
++
++# PRICE DATA --------------------------------------------------------------
++# Import dailz data
++prices = qc_daily(
++  file_path = "F:/lean/data/stocks_daily.csv",
++  min_obs = 2 * 252,
++  price_threshold = 1e-008,
++  add_dv_rank = TRUE
++)
++
++
++# PREPARE DATA ------------------------------------------------------------
++# Keep only last 2 years of data
++prices = prices[date >= (Sys.Date() - (2 * 365))]
++
++# Inspect
++prices[symbol == "aapl"]
++prices[, max(date)]
++
++# To long format
++prices = dcast(prices[, .(symbol, date, close)], date ~ symbol, value.var = "close")
++
++# Keep only symbols with almost no NA values
++keep_cols = names(which(colMeans(!is.na(prices)) > 0.99))
++prices = prices[, .SD, .SDcols = keep_cols]
++
++# Convert to xts and take logs
++train = as.xts.data.table(prices) # convert to xts
++train = train[, colSums(!is.na(train)) == max(colSums(!is.na(train)))]
++train = log(train)
++
++
++dim(train)
++
++# COARSE BEST PAIRS -------------------------------------------------------
++# choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
++pci_tests_i = list()
++s = Sys.time()
++for (j in 1:ncol(train)) { #
++
++  # DEBUG
++  print(j)
++  # j = which(names(train) == "abh")
++
++  # quasi multivariate pairs
++  hedge = tryCatch(hedge.pci(train[, j], train[, -j],
++                             maxfact = 1,
++                             use.multicore = FALSE,
++                             search_type = "lasso"),
++                   error = function(e) NULL)
++  if (is.null(hedge)) {
++    pci_tests_i[[j]] = NULL
++    next()
++  }
++
++  # pci fit
++  test_pci = test.pci(train[, j], hedge$pci$basis)
++
++  # summary table
++  results = data.table(t(hedge$index_names))
++  names(results) = paste0("series_", seq_along(results) + 1)
++  results = cbind(series_1 = hedge$pci$target_name, results)
++
++  # summary table
++  metrics = c(
++    hedge$pci$beta,
++    hedge$pci$rho,
++    hedge$pci$sigma_M,
++    hedge$pci$sigma_R,
++    hedge$pci$M0,
++    hedge$pci$R0,
++    hedge$pci$beta.se,
++    hedge$pci$rho.se,
++    hedge$pci$sigma_M.se,
++    hedge$pci$sigma_R.se,
++    hedge$pci$M0.se,
++    hedge$pci$R0.se,
++    hedge$pci$negloglik,
++    hedge$pci$pvmr
++  )
++
++  # Change names
++  names(metrics)[names(metrics) %in% names(hedge$pci$beta)] = paste0("beta_", seq_along(hedge$pci$beta))
++  names(metrics)[names(metrics) %in% names(hedge$pci$beta.se)] = paste0("beta_", seq_along(hedge$pci$beta.se), "_se")
++  names(metrics)[names(metrics) %in% names(hedge$pci$rho.se)][2] = "rho_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_M.se)][2] = "sigma_M_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_R.se)][2] = "sigma_R_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$M0.se)][2] = "M0_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$R0.se)][2] = "R0_se"
++
++  # Convert to data.table, add resulsts to metricsa and p values
++  metrics = as.data.table(as.list(metrics))
++  results = cbind(results, metrics)
++
++  # Save results
++  pci_tests_i[[j]] = cbind(results,
++                           p_rw = test_pci$p.value[1],
++                           p_ar = test_pci$p.value[2])
++}
++e = Sys.time()
++print(e - s)
++pci_tests = rbindlist(pci_tests_i, fill = TRUE)
++
++# Save
++file_name = paste0("pci-", Sys.Date(), ".csv")
++file_name = file.path("D:/strategies/pci", file_name)
++fwrite(pci_tests, file_name)
++
++
++# FILTER PAIRS ------------------------------------------------------------
++# https://www.econstor.eu/bitstream/10419/140632/1/858609614.pdf
++# page 14 above
++# Apply restrictions to the universe
++# 1) pairs with a half-life of mean-reversion of one day or less - thereby avoiding to select
++#where trading gains are largely attributable to bid-ask bounce
++# 2) pvmr > 0.5 ensures    pairs  more reliable parameter estimates
++# 3) p_rw < 0.05 & p_ar < 0.05. A time series is classified as partially cointegrated,
++#    if and only if the random walk as well as the AR(1)-hypotheses are rejected
++# 3) my condition: MR p value should be lower than 0.05 because this test confirms mean reverting component
++# 4) restriction to same sector I DON'T WANT APPLY THIS FOR  NOW
++# 5) 25% lowest  by neLog
++# 6) possible to add additional fundamental matching
++pci_tests_eligible = pci_tests[pvmr > 0.5  & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05]
++pci_tests_eligible[, nq := quantile(negloglik, probs = 0.25)]
++pci_tests_eligible = pci_tests_eligible[negloglik <= nq]
++
++# remove same pairs
++pci_tests_eligible = pci_tests_eligible[, .SD[!(series_2 %in% series_1)]]
++
++
++
++# INSAMPLE SHARPE ---------------------------------------------------------
++# Function to generate zscore
++generate_signal_zscore = function(Z_score, threshold_long, threshold_short) {
++  signal = Z_score
++  colnames(signal) = "signal"
++  signal[] = NA
++
++  # initial position
++  signal[1] = 0
++  if (Z_score[1] <= threshold_long[1]) {
++    signal[1] = 1
++  } else if (Z_score[1] >= threshold_short[1])
++    signal[1] = -1
++
++  # loop
++  for (t in 2:nrow(Z_score)) {
++    if (signal[t-1] == 0) {  # if we were in no position
++      if (Z_score[t] <= threshold_long[t]) {
++        signal[t] = 1
++      } else if(Z_score[t] >= threshold_short[t]) {
++        signal[t] = -1
++      } else signal[t] = 0
++    } else if (signal[t-1] == 1) {  #if we were in a long position
++      if (Z_score[t] >= 0) signal[t] = 0
++      else signal[t] = signal[t-1]
++    } else {  #if we were in a short position
++      if (Z_score[t] <= 0) signal[t] = 0
++      else signal[t] = signal[t-1]
++    }
++  }
++  return(signal)
++}
++
++# main function to analyse pairs
++pairs_trading_pci = function(n, std_entry = 2, plot_pnl = TRUE) {
++  # Get tickers
++  ticker_1 = pci_tests_eligible[n, series_1]
++  ticker_2 = pci_tests_eligible[n, series_2]
++
++  # Fit pci and get spreads
++  fit_pci = fit.pci(train[, ticker_1], train[, ticker_2])
++  hs_train = statehistory.pci(fit_pci)
++  spread = xts(hs_train[, 4], as.Date(rownames(hs_train)))
++
++  # Z-score
++  spread_var = sd(spread)
++  Z_score_M = spread/spread_var
++
++  # generate signals with z scored
++  threshold_long = threshold_short = Z_score_M
++  threshold_short[] = std_entry
++  threshold_long[] = -std_entry
++
++  # get and plot signals
++  signal = generate_signal_zscore(Z_score_M, threshold_long, threshold_short)
++
++  # let's compute the PnL directly from the signal and spread
++  spread_return = diff(Z_score_M)
++  traded_return = spread_return * lag(signal)   # NOTE THE LAG!!
++  traded_return[is.na(traded_return)] = 0
++  colnames(traded_return) = "traded spread"
++
++  # Total
++  res_ = mean(traded_return, na.rm = TRUE)
++  sd_ = sd(traded_return, na.rm = TRUE)
++
++  return(res_ / sd_)
++}
++
++# Get insample results
++results = vapply(1:nrow(pci_tests_eligible),
++                 function(i) pairs_trading_pci(i),
++                 FUN.VALUE = numeric(1L))
++results_dt = cbind(pci_tests_eligible, insample_performance = results)
++
++# Inspect 20 best
++setorder(results_dt, -insample_performance, na.last = TRUE)
++results_dt
++
++
++# SAVE --------------------------------------------------------------------
++# Save locally and to Azure blob
++bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                               Sys.getenv("BLOB-KEY"))
++cont = storage_container(bl_endp_key, "qc-live")
++file_name_ = paste0("pci-", update(Sys.Date(), day = 2), ".csv")
++storage_write_csv(as.data.frame(head(results_dt, 20)), cont, file_name_)
+diff --git a/prepare_predcitors.R b/prepare_predcitors.R
+new file mode 100644
+index 0000000..e019f73
+--- /dev/null
++++ b/prepare_predcitors.R
+@@ -0,0 +1,42 @@
++library(qlcal)
++library(arrow)
++library(data.table)
++library(finutils)
++library(finfeatures)
++
++
++# SET UP ------------------------------------------------------------------
++# set calendar
++qlcal::setCalendar("UnitedStates/NYSE")
++
++# Paths
++URIFACTORS = "F:/data/equity/us/predictors_daily/factors"
++PREDICTORS_SAVE = "D:/strategies/statsarb"
++list.files(URIFACTORS)
++
++
++# PREDICTORS ---------------------------------------------------------------
++# Fundamental predictors
++fundamentals = read_parquet(file.path(URIFACTORS, "fundamental_factors.parquet"))
++
++# Prices
++prices = qc_daily_parquet(
++  file_path = "F:/lean/data/all_stocks_daily",
++  min_obs = 1100,
++  duplicates = "fast"
++)
++prices[, month := data.table::yearmon(date)]
++
++# Predictors
++prices[, index := date == data.table::last(date), by = .(symbol, month)]
++at_ = prices[, which(index)]
++prices[, c("index") := NULL]
++predictors_ohlcv = OhlcvFeaturesDaily$new(
++  at = at_,
++  windows = c(5, 10, 22, 66, 125, 252, 500, 1000),
++  quantile_divergence_window = c(22, 66, 125, 252, 500, 1000)
++)
++predictors = predictors_ohlcv$get_ohlcv_features(copy(prices))
++
++# Save predictors
++fwrite(predictors, file.path(PREDICTORS_SAVE, "predctors.csv"))
+diff --git a/results.pci.R b/results.pci.R
+index e04469f..771581b 100644
+--- a/results.pci.R
++++ b/results.pci.R
+@@ -32,8 +32,8 @@ pci_tests[, .(pvmr_miss = sum(is.na(pvmr)),
+ pci_tests = na.omit(pci_tests, cols = c("pvmr", "rho", "p_rw", "p_ar", "negloglik"))
+ 
+ # Check one meta row
+-pci_test[search_type == "lasso" & maxfact == 1 & train_size == 24]
+-pci_test[search_type == "lasso" & maxfact == 1 & train_size == 24] |>
++pci_tests[search_type == "lasso" & maxfact == 1 & train_size == 24]
++pci_tests[search_type == "lasso" & maxfact == 1 & train_size == 24] |>
+   _[pvmr > 0.5  & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05 &
+       negloglik <= quantile(negloglik, probs = 0.25)]
+ 
+@@ -228,7 +228,7 @@ pairs_trading_pci_performance = function(train_start,
+   spread_var = sd(spread_train)
+   if (spread_var == 0) {
+     print("Spread variance is zero")
+-    return(NULL)
++    return(NA)
+   }
+   Z_score_M = spread/spread_var
+ 
+@@ -243,7 +243,7 @@ pairs_trading_pci_performance = function(train_start,
+     error = function(e) NULL)
+   if (is.null(signal)) {
+     print("Error in signal generation")
+-    return(NULL)
++    return(NA)
+   }
+ 
+   # let's compute the PnL directly from the signal and spread
+@@ -259,7 +259,7 @@ pairs_trading_pci_performance = function(train_start,
+     traded_return = traded_return[paste0(train_start, "/", train_end)]
+   }
+ 
+-  return(traded_return)
++  return(mean(traded_return, na.rm = TRUE) / sd(traded_return, na.rm = TRUE))
+ }
+ 
+ # example
+@@ -272,14 +272,74 @@ pairs_trading_pci_performance(
+   std_entry = 1
+ )
+ 
+-# Define all parameters
+-params = expand.grid(
+-  train_start = meta,
+-  train_end = pci_tests_eligible[, train_end],
+-  ticker_1 = pci_tests_eligible[, series_1],
+-  ticker_2 = pci_tests_eligible[, series_2],
+-  std_entry = 1
+-)
++############ NOT SURE WHAT IS META HERE ###############
++# # Define all parameters
++# params = expand.grid(
++#   train_start = meta,
++#   train_end = pci_tests_eligible[, train_end],
++#   ticker_1 = pci_tests_eligible[, series_1],
++#   ticker_2 = pci_tests_eligible[, series_2],
++#   std_entry = 1
++# )
++############ NOT SURE WHAT IS META HERE ###############
++
++# Generate results for my params. Later above is for all parameters
++pci_tests_eligible_sample = pci_tests_eligible[
++  search_type == "lasso" & maxfact ==1 & train_size == 24
++]
++s = Sys.time()
++pnl_by_i = vapply(1:nrow(pci_tests_eligible_sample), function(j) {
++  print(j)
++  pairs_trading_pci_performance(
++    train_start = pci_tests_eligible_sample[j, train_start],
++    train_end = pci_tests_eligible_sample[j, train_end],
++    ticker_1 = pci_tests_eligible_sample[j, series_1],
++    ticker_2 = pci_tests_eligible_sample[j, series_2],
++    std_entry = 1,
++    set = "train"
++  )
++}, FUN.VALUE = numeric(1))
++e = Sys.time()
++e - s
++cbind(pci_tests_eligible_sample[1:20], pnl_by_i)
++
++# Merge pairs data and insample results
++pairs_insample = cbind(pci_tests_eligible_sample, pnl_by_i)
++
++# Extract best pairs for date
++setorder(pairs_insample, train_end, -pnl_by_i)
++pairs_insample_best = pairs_insample[, head(.SD, 20), by = train_end]
++
++# Define dates
++dates = pairs_insample_best[, sort(unique(train_end))]
++
++# Delete files on blob
++bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                               Sys.getenv("BLOB-KEY"))
++cont = storage_container(bl_endp_key, "qc-backtest")
++files_remove = AzureStor::list_blobs(cont)
++files_remove = files_remove$name[grepl("pci-", files_remove$name)]
++for (f in files_remove) {
++  AzureStor::delete_blob(cont, f, confirm = FALSE)
++}
++
++# Extract for every month and save every file separetly
++cont = storage_container(bl_endp_key, "qc-backtest")
++for (d in dates) {
++  # d = dates[1]
++  print(d)
++
++  # Save
++  best_pairs = pairs_insample_best[train_end == d]
++  file_name_ = paste0("pci-", as.Date(d), ".csv")
++  storage_write_csv(as.data.frame(best_pairs), cont, file_name_)
++}
++
++
++
++
++
++
+ 
+ # Generate for all pairs for all meta rows
+ plan(multisession, workers = 8L)
+@@ -341,6 +401,93 @@ Return.portfolio(pnl_by_i)
+ charts.PerformanceSummary(Return.portfolio(pnl_by_i))
+ 
+ 
++
++# UNIVERSE BY MONTH QC ----------------------------------------------------
++# Choose parameters
++param_search_type_qc = "lasso"
++param_maxfact_qc = 1
++param_train_size_qc = 24
++pci_tests_eligible
++pci_eligible_qc = pci_tests_eligible[
++  search_type == param_search_type_qc &
++    maxfact == param_maxfact_qc &
++    train_size == param_train_size_qc
++]
++setorder(pci_eligible_qc, train_start)
++
++# main function to analyse pairs
++pairs_trading_pci = function(n, std_entry = 2, plot_pnl = TRUE) {
++  # Get tickers
++  ticker_1 = pci_tests_eligible[n, series_1]
++  ticker_2 = pci_tests_eligible[n, series_2]
++
++  # Fit pci and get spreads
++  fit_pci = fit.pci(train[, ticker_1], train[, ticker_2])
++  hs_train = statehistory.pci(fit_pci)
++  spread = xts(hs_train[, 4], as.Date(rownames(hs_train)))
++
++  # Z-score
++  spread_var = sd(spread_train)
++  Z_score_M = spread/spread_var
++
++  # generate signals with z scored
++  threshold_long = threshold_short = Z_score_M
++  threshold_short[] = std_entry
++  threshold_long[] = -std_entry
++
++  # get and plot signals
++  signal = generate_signal_zscore(Z_score_M, threshold_long, threshold_short)
++
++  # let's compute the PnL directly from the signal and spread
++  spread_return = diff(Z_score_M)
++  traded_return = spread_return * lag(signal)   # NOTE THE LAG!!
++  traded_return[is.na(traded_return)] = 0
++  colnames(traded_return) = "traded spread"
++
++  # Total
++  res_ = mean(traded_return, na.rm = TRUE)
++  sd_ = sd(traded_return, na.rm = TRUE)
++
++  return(res_ / sd_)
++}
++
++# Get insample results
++results = vapply(1:nrow(pci_eligible_qc),
++                 function(i) pairs_trading_pci(i),
++                 FUN.VALUE = numeric(1L))
++results_dt = cbind(pci_tests_eligible, insample_performance = results)
++
++# Inspect 20 best
++setorder(results_dt, -insample_performance, na.last = TRUE)
++results_dt
++
++# Define dates
++dates = pci_eligible_qc[, sort(unique(train_end))]
++
++# Delete files on blob
++bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                               Sys.getenv("BLOB-KEY"))
++cont = storage_container(bl_endp_key, "qc-backtest")
++files_remove = AzureStor::list_blobs(cont)
++files_remove = files_remove$name[grepl("pci-", files_remove$name)]
++for (f in files_remove) {
++  AzureStor::delete_blob(cont, f, confirm = FALSE)
++}
++
++# Extract for every month and save every file separetly
++cont = storage_container(bl_endp_key, "qc-backtest")
++for (d in dates) {
++  # d = dates[1]
++  print(d)
++
++  # Save
++  best_pairs = pci_eligible_qc[train_end == d]
++  file_name_ = paste0("pci-", as.Date(d), ".csv")
++  storage_write_csv(as.data.frame(best_pairs), cont, file_name_)
++}
++
++
++
+ # DATA FOR QC -------------------------------------------------------------
+ # Choose best parameters
+ param_search_type_qc = "lasso"
+@@ -436,8 +583,15 @@ bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
+                                Sys.getenv("BLOB-KEY"))
+ cont = storage_container(bl_endp_key, "qc-backtest")
+ sample_ = qc_data[date > as.Date("2020-01-01")]
++sample_[, unique(date)]
+ sample_[, date := paste0(date, " 15:59:00")]
+-storage_write_csv(sample_, cont, "pci.csv", col_names = FALSE)
++sample_ = sample_[, .(
++  symbol_1 = paste0(symbol_1, collapse = "|"),
++  symbol_2 = paste0(symbol_2, collapse = "|"),
++  beta = paste0(beta, collapse = "|"),
++  spread = paste0(Z_score_M, collapse = "|")
++), by = date]
++storage_write_csv(sample_, cont, "pci_p.csv", col_names = TRUE)
+ 
+ # # save data to QC
+ # bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
+diff --git a/rw_equity_pairs_trading.qmd b/rw_equity_pairs_trading.qmd
+new file mode 100644
+index 0000000..8258957
+--- /dev/null
++++ b/rw_equity_pairs_trading.qmd
+@@ -0,0 +1,28 @@
++---
++title: "RW equity pairs trading"
++format: html
++editor: visual
++---
++
++## 
++
++# Time series features
++
++## Spread data
++
++For each pair in the universe calculate:
++
++-   Ratio of their prices
++
++-   20d rolling mean of the ratio
++
++-   20d standard deviation of the ratio
++
++-   zscore of the ratio - $(price-mean)/stdev$
++
++Questions:
++
++1.  Why do you calculate `lsr` and `distance` futures on monthly basis (group by month) and than you sum by year? Whay do you don't calculate those features on year basis in the begining?
++2.  What should we do with 2 stocks for same company, say GOOG and GOOGL?
++3.  Should we explude ETF's and/or funds?
++4.  
+diff --git a/rw_meets_pci.R b/rw_meets_pci.R
+new file mode 100644
+index 0000000..00616fa
+--- /dev/null
++++ b/rw_meets_pci.R
+@@ -0,0 +1,174 @@
++library(fastverse)
++library(finutils)
++library(xts)
++library(partialCI)
++
++
++# DATA --------------------------------------------------------------------
++# RW pairs
++PATH_SAVE = "D:/strategies/statsarb"
++pairs_features = fread(file.path(PATH_SAVE, "pairs_features.csv"))
++
++
++# Prices
++prices = qc_daily(
++  file_path = "F:/lean/data/stocks_daily.csv",
++  min_obs = 252,
++  duplicates = "fast",
++  price_threshold = 1e-008
++)
++prices = prices[date > as.Date("2010-01-01")]
++prices[, fmp_symbol := gsub("\\.\\d$", "", symbol)]
++prices[, fmp_symbol := toupper(fmp_symbol)]
++
++
++# FILTERING ---------------------------------------------------------------
++# Best pairs
++best = pairs_features[same_industry == 1 &
++                        isfund1 == FALSE & isfund2 == FALSE &
++                        name1 != name2 & isin1 != isin2,
++                      .(stock1, stock2, combo_score_2021, combo_score_2022,
++                        combo_score_2023, combo_score_2024)]
++best = melt(best, id.vars = c("stock1", "stock2"))
++best = na.omit(best)
++best[, year := as.integer(gsub("combo_score_", "", variable))]
++best[, variable := NULL]
++setorder(best, year, -value)
++
++# Extract 1000 best
++best = best[, head(.SD, 1000), by = year]
++
++
++
++# ESTIMATE PCI ------------------------------------------------------------
++# Estimate pci for best paris
++setkey(prices, fmp_symbol)
++symbols = prices[, unique(fmp_symbol)]
++pci_results = list()
++for (i in 1:nrow(best)) {
++  print(i)
++
++  # Extract pair
++  pair_ = best[i]
++
++  # test for symbols
++  if (!(pair_[, stock1] %in% symbols &  pair_[, stock2] %in% symbols)) {
++    print("Symbols not in data")
++    pci_results[[i]] = data.table(
++      stock1 = pair_[, stock1],
++      stock2 = pair_[, stock2]
++    )
++    next
++  }
++
++  # Prepare data for PCI
++  dt_ = prices[pair_[, c(stock1, stock2)], .(date, fmp_symbol, close)]
++  year_ = pair_[, year]
++  start_date = as.Date(paste0(year_-1, "-01-01")) - 30
++  end_date   = as.Date(paste0(year_-1, "-12-31"))
++  dt_ = dt_[date %between% c(start_date, end_date)]
++  if (anyDuplicated(dt_, by = c("date", "fmp_symbol"))) {
++    print("Duplicated data")
++    pci_results[[i]] = data.table(
++      stock1 = pair_[, stock1],
++      stock2 = pair_[, stock2]
++    )
++    next
++  }
++  dt_ = dcast(dt_, date ~ fmp_symbol, value.var = "close")
++  dt_ = na.omit(dt_)
++  if (nrow(dt_) < 200) {
++    print("Too few data")
++    pci_results[[i]] = data.table(
++      stock1 = pair_[, stock1],
++      stock2 = pair_[, stock2]
++    )
++    next
++  }
++  train = as.xts.data.table(dt_)
++  train = log(train)
++
++  # Test pci
++  fit_pci  = fit.pci(train[, 1], train[, 2])
++  test_pci = test.pci(train[, 1], train[, 2])
++  p_rw = test_pci$p.value[1]
++  p_ar = test_pci$p.value[2]
++  p_joint = test_pci$p.value[3]
++
++  # summary table
++  results = data.table(
++    stock1 = fit_pci$target_name,
++    stock2 = fit_pci$factor_names
++  )
++
++  # summary table
++  metrics = c(
++    fit_pci$beta,
++    fit_pci$rho,
++    fit_pci$sigma_M,
++    fit_pci$sigma_R,
++    fit_pci$M0,
++    fit_pci$R0,
++    fit_pci$beta.se,
++    fit_pci$rho.se,
++    fit_pci$sigma_M.se,
++    fit_pci$sigma_R.se,
++    fit_pci$M0.se,
++    fit_pci$R0.se,
++    fit_pci$negloglik,
++    fit_pci$pvmr
++  )
++
++  # Change names
++  names(metrics)[names(metrics) %in% names(fit_pci$beta)] = paste0("beta_", seq_along(fit_pci$beta))
++  names(metrics)[names(metrics) %in% names(fit_pci$beta.se)] = paste0("beta_", seq_along(fit_pci$beta.se), "_se")
++  names(metrics)[names(metrics) %in% names(fit_pci$rho.se)][2] = "rho_se"
++  names(metrics)[names(metrics) %in% names(fit_pci$sigma_M.se)][2] = "sigma_M_se"
++  names(metrics)[names(metrics) %in% names(fit_pci$sigma_R.se)][2] = "sigma_R_se"
++  names(metrics)[names(metrics) %in% names(fit_pci$M0.se)][2] = "M0_se"
++  names(metrics)[names(metrics) %in% names(fit_pci$R0.se)][2] = "R0_se"
++
++  # Convert to data.table, add resulsts to metricsa and p values
++  metrics = as.data.table(as.list(metrics))
++  pci_results[[i]] = cbind(results,
++                           year = year_,
++                           metrics,
++                           p_rw = test_pci$p.value[1],
++                           p_ar = test_pci$p.value[2])
++}
++pci_results_dt = rbindlist(pci_results, fill = TRUE)
++
++# Remove missing
++pci_results_dt = na.omit(pci_results_dt, cols = c("beta_1"))
++
++
++# FILTER PAIRS ------------------------------------------------------------
++# Apply restrictions to the universe
++# 1) pairs with a half-life of mean-reversion of one day or less - thereby avoiding to select
++#where trading gains are largely attributable to bid-ask bounce
++# 2) pvmr > 0.5 ensures    pairs  more reliable parameter estimates
++# 3) p_rw < 0.05 & p_ar < 0.05. A time series is classified as partially cointegrated,
++#    if and only if the random walk as well as the AR(1)-hypotheses are rejected
++# 3) my condition: MR p value should be lower than 0.05 because this test confirms mean reverting component
++# 4) restriction to same sector I DON'T WANT APPLY THIS FOR  NOW
++# 5) 25% lowest  by neLog
++# 6) possible to add additional fundamental matching
++pci_tests_eligible = pci_results_dt[pvmr > 0.5  & rho > 0.5 &  p_rw < 0.05 & p_ar < 0.05]
++pci_tests_eligible[, nq := quantile(negloglik, probs = 0.25)]
++pci_tests_eligible = pci_tests_eligible[negloglik <= nq]
++
++# remove same pairs
++pci_tests_eligible = pci_tests_eligible[, .SD[!(stock2 %in% stock1)]]
++
++# Merge best and pci filteresd
++best_pci = merge(best, pci_tests_eligible,
++                 by.x = c("stock1", "stock2", "year"),
++                 by.y = c("stock1", "stock2", "year"),
++                 all.x = TRUE,
++                 all.y = FALSE
++)
++best_pci = na.omit(best_pci, cols = c("beta_1"))
++
++# Save for azure
++best_pci[year == 2024]
++fwrite(best_pci, file.path(PATH_SAVE, "pairs_best_pci.csv"))
+diff --git a/rw_pairs.csv b/rw_pairs.csv
+new file mode 100644
+index 0000000..31c00b7
+--- /dev/null
++++ b/rw_pairs.csv
+@@ -0,0 +1,54 @@
++stock1,stock2,value,year,weight
++HR,HTA,98.33333333,2020,0.12
++CUBE,EXR,98.16666667,2020,0.108
++DRE,FR,97.75,2020,0.108
++ELS,SUI,97.5,2020,0.12
++PCH,WY,97.41666667,2020,0.12
++BRX,KIM,97.25,2020,0.12
++DCI,PH,97,2020,0.0996
++CFG,KEY,96.58333333,2020,0.12
++AEP,SO,96.5,2020,0.072
++AEP,XEL,96.5,2020,0.072
++CMS,WEC,96.5,2020,0.144
++PAA,PAGP,98.33333333,2021,0.109
++H,MAR,98.16666667,2021,0.109
++LSI,NSA,97.75,2021,0.072
++CPT,MAA,97.5,2021,0.072
++MCO,SPGI,97.41666667,2021,0.109
++ATO,NI,97.25,2021,0.109
++DRH,PEB,97,2021,0.072
++MET,MFC,96.58333333,2021,0.109
++BP,TTE,96.5,2021,0.109
++ARCC,GBDC,96.5,2021,0.109
++ETN,MWA,96.5,2021,0.109
++ALK,JBLU,,2021,0.109
++PAA,PAGP,99.66666667,2022,0.072
++AEE,FTS,98.77777778,2022,0.072
++CUZ,HIW,98.44444444,2022,0.109
++ARCC,NMFC,98.33333333,2022,0.109
++AVB,EQR,98.05555556,2022,0.072
++HLT,MAR,97.72222222,2022,0.109
++NTRS,SEIC,97.66666667,2022,0.109
++DUK,FTS,97.5,2022,0.109
++FFBC,FNB,97.5,2022,0.109
++RSG,WM,97.38888889,2022,0.109
++PAA,PAGP,99.3077687,2023,0.072
++ARCC,TSLX,98.92315302,2023,0.072
++ARCC,NMFC,97.96161382,2023,0.109
++ASB,HBAN,97.57699814,2023,0.109
++MPLX,PAGP,97.53853657,2023,0.072
++FFBC,ONB,97.500075,2023,0.109
++ET,PAGP,97.38469,2023,0.109
++KNX,WERN,97.15392089,2023,0.109
++MCO,SPGI,97.11545932,2023,0.109
++BSX,SYK,97.07699775,2023,0.109
++PAA,PAGP,99.8,2024,0.072
++BEP,BEPC,98.5,2024,0.072
++MCO,SPGI,98.5,2024,0.109
++ASB,HBAN,98.5,2024,0.109
++KNX,WERN,98.4,2024,0.072
++FTS,LNT,98.4,2024,0.109
++LADR,RITM,98.3,2024,0.109
++HBAN,WTFC,97.9,2024,0.109
++AM,WES,97.8,2024,0.109
++ARCC,TSLX,97.6,2024,0.109
+diff --git a/rw_prepare.R b/rw_prepare.R
+new file mode 100644
+index 0000000..4e2a14d
+--- /dev/null
++++ b/rw_prepare.R
+@@ -0,0 +1,390 @@
++library(fastverse)
++library(finutils)
++library(ggplot2)
++library(arrow)
++library(httr)
++library(roll)
++library(lubridate)
++library(AzureStor)
++
++
++# SETUP -------------------------------------------------------------------
++# Save path
++PATH_SAVE = "D:/strategies/statsarb"
++
++
++# DATA --------------------------------------------------------------------
++# Import daily data
++prices = qc_daily_parquet(
++  file_path = "F:/lean/data/all_stocks_daily",
++  min_obs = 2 * 252,
++  price_threshold = 1e-008,
++  duplicates = "fast",
++  add_dv_rank = FALSE,
++  add_day_of_month = FALSE,
++  etfs = FALSE,
++  profiles_fmp = TRUE,
++  fmp_api_key = "6c390b6279b8a67cc7f63cbecbd69430"
++)
++prices[, y := data.table::year(date)]
++prices[, q := data.table::yearqtr(date)]
++prices[, fmp_ticker := gsub("\\.\\d+", "", toupper(symbol))]
++symbols = prices[, unique(fmp_ticker)]
++
++# Market cap
++mcap = read_parquet("F:/data/equity/us/fundamentals/market_cap.parquet")
++mcap = mcap[symbol %in% symbols]
++setorder(mcap, symbol, date)
++setnames(mcap, "symbol", "fmp_ticker")
++plot(mcap[fmp_ticker == "MSFT", marketCap], main = "MSFT")
++plot(mcap[fmp_ticker == "META", marketCap], main = "META")
++
++# Merge prices and market cap
++prices = merge(prices, mcap, by = c("fmp_ticker", "date"), all.x = TRUE, all.y = FALSE)
++prices[, sum(is.na(marketCap)) / nrow(prices)]
++
++# Get profiles for industry
++parts = 0:10
++for (part in parts) {
++  GET("https://financialmodelingprep.com/stable/profile-bulk",
++      query = list(apikey = "6c390b6279b8a67cc7f63cbecbd69430", part = part),
++      write_disk(paste0("profile_", part, ".csv")))
++}
++profile_files = paste0("profile_", parts, ".csv")
++profile = lapply(profile_files, fread)
++profile = rbindlist(profile, fill = TRUE)
++profile = unique(profile, by = "symbol")
++profile = profile[symbol %in% symbols]
++lapply(profile_files, file.remove)
++
++# Merge prices and profile
++profile_sample = profile[, .(symbol, sector, industry, isEtf)]
++setnames(profile_sample, "symbol", "fmp_ticker")
++
++
++# LIQUID UNIVERSE ---------------------------------------------------------
++# Averge unadjusted price > 5
++coarse_avg_price = prices[, .(avg_price = mean(close_raw)), by = .(symbol, q)]
++coarse_avg_price[, universe_avg_price := FALSE]
++coarse_avg_price[shift(avg_price) >= 5, universe_avg_price := TRUE, by = symbol]
++print(paste0("We remove ",
++             round(sum(coarse_avg_price$universe_avg_price == FALSE) / nrow(coarse_avg_price) * 100),
++             "% of rows."))
++
++# Average volume > 300.000
++coarse_avg_vol = prices[, .(avg_volume = mean(volume)), by = .(symbol, q)]
++coarse_avg_vol[, universe_avg_vol := FALSE]
++coarse_avg_vol[shift(avg_volume) >= 300000, universe_avg_vol := TRUE, by = symbol]
++print(paste0("We remove ",
++             round(sum(coarse_avg_vol$universe_avg_vol == FALSE) / nrow(coarse_avg_vol) * 100),
++             "% of rows."))
++
++# Average market cap > 1 bil
++coarse_avg_mcap = prices[, .(avg_mcap = data.table::last(marketCap)), by = .(symbol, q)]
++coarse_avg_mcap[, universe_avg_mcap := FALSE]
++coarse_avg_mcap[shift(avg_mcap) >= 1e9, universe_avg_mcap := TRUE, by = symbol]
++print(paste0("We remove ",
++             round(sum(coarse_avg_mcap$universe_avg_mcap == FALSE) / nrow(coarse_avg_mcap) * 100),
++             "% of rows."))
++
++# Combine coarse
++coarse = merge(coarse_avg_price, coarse_avg_vol, by = c("symbol", "q"))
++coarse = merge(coarse, coarse_avg_mcap, by = c("symbol", "q"))
++coarse[, universe := (universe_avg_vol + universe_avg_price + universe_avg_mcap) == 3]
++coarse = coarse[y > 1998]
++
++# Plots
++bins_ = coarse[, min(q)]:coarse[, max(q)]
++coarse[universe == TRUE][, .N, by = q][order(q)] |>
++  ggplot(aes(q, N)) +
++  geom_col() +
++  scale_x_binned(breaks = bins_)
++
++# Keep only coarse universe
++prices_coarse = merge(prices, coarse[, .(symbol, q, universe)], by = c("symbol", "q"), all.x = TRUE)
++prices_coarse = prices_coarse[universe == TRUE]
++
++
++# PAIRS -------------------------------------------------------------------
++# Merge coarse prices and profiles
++prices_coarse = merge(prices_coarse, profile_sample, by = "fmp_ticker")
++prices_coarse[, unique(sector)]
++prices_coarse[, unique(industry)]
++
++# Create pairs for every quarter
++quarters = prices_coarse[, sort(unique(q))]
++pairs_universe = list()
++for (i in seq_along(quarters)) {
++  print(i)
++  # data
++  q_ = quarters[i]
++  dt_ = prices_coarse[q == q_]
++
++  # create all possible pairs
++  pairs_all = dt_[, unique(fmp_ticker)]
++  pairs_all = CJ(stock1 = pairs_all, stock2 = pairs_all, unique = TRUE)
++  pairs_all = pairs_all[stock1 != stock2]
++  pairs_all[, `:=`(first = pmin(stock1, stock2), second = pmax(stock1, stock2))]
++  pairs_all = unique(pairs_all, by = c("first", "second"))
++  pairs_all[, c("first", "second") := NULL]
++
++  # Merge industries and sectors for each stock in the pair
++  pairs_all = merge(pairs_all, profile_sample, by.x = "stock1", by.y = "fmp_ticker")
++  cols = c("sector", "industry", "isEtf")
++  setnames(pairs_all, cols, paste0(cols, "_stock1"))
++  pairs_all = merge(pairs_all, profile_sample, by.x = "stock2", by.y = "fmp_ticker")
++  setnames(pairs_all, cols, paste0(cols, "_stock2"))
++  pairs_all[, same_sector := 0]
++  pairs_all[sector_stock1 == sector_stock2, same_sector := 1]
++  pairs_all = merge(pairs_all, profile_sample, by.x = "stock2", by.y = "fmp_ticker")
++  pairs_all[, same_industry := 0]
++  pairs_all[industry_stock1 == industry_stock2, same_industry := 1]
++  pairs_all = pairs_all[, .(stock1, stock2, same_sector, same_industry)]
++
++  # merge year and save to list
++  pairs_all[, q := q_]
++  pairs_universe[[i]] = pairs_all
++}
++pairs_universe = rbindlist(pairs_universe)
++setorder(pairs_universe, q)
++
++
++# TIME SERIES FEATURES ----------------------------------------------------
++# TODO: Choose year, but later maybe expand for all years
++# YEARS = 2020:2025
++QUARTERS = prices_coarse[, sort(unique(q))]
++STARTY   = 2022
++pairs_universe_l = list()
++for (i in seq_along(QUARTERS)) {
++  # Extract year
++  # i = 80
++  print(i)
++
++  # Choose last quartal
++  Q = QUARTERS[i]
++
++  # Test if qaurter in set
++  if (QUARTERS[i] < STARTY) {
++    pairs_universe_l[[i]] = NULL
++    next
++  }
++
++  # Extract last 4 quarters
++  # qs = QUARTERS[(i - 5):(i - 1)]
++
++  # Spreads
++  pairsy = pairs_universe[q == Q]
++
++  # DEBUG
++  # pairsy[stock1 == "PAA" & stock2 == "PAGP"]
++  # pairsy[stock1 == "BEP" & stock2 == "BEPC"]
++  # pairsy[stock1 == "MCO" & stock2 == "SPGI"]
++  # pairsy[stock1 == "ASB" & stock2 == "HBAN"]
++  # pairsy[stock1 == "KNX" & stock2 == "WERN"]
++  # chunks = pairsy[(stock1 == "PAA" & stock2 == "PAGP") |
++  #                   (stock1 == "BEP" & stock2 == "BEPC")]
++  # dt_ = copy(chunks)
++
++  # Divide number of rows of pairs universe to 100 chunks
++  chunks = split(pairsy, cut(1:nrow(pairsy), breaks = 75))
++
++  # Loop over chunks to calcluate time series features
++  pairs_time_series_features_l = list()
++  for (j in seq_along(chunks)) {
++    # j = 1
++    print(j)
++    # Prepare chunk
++    dt_ = chunks[[j]]
++    dt_ = dt_[, .(stock1, stock2)]
++    start_date = zoo::as.Date.yearqtr(Q-0.25) - 365 - 30
++    end_date   = zoo::as.Date.yearqtr(Q-0.25)
++    dates = prices[date %between% c(start_date, end_date), sort(unique(date))]
++    dt_ = dt_[, .(date = dates), by = .(stock1, stock2)]
++
++    # Merge prices with pairs and dates
++    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock1", "date")]
++    setnames(dt_, c("fmp_ticker", "close"), c("stock1", "close1"))
++    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock2", "date")]
++    setnames(dt_, c("fmp_ticker", "close"), c("stock2", "close2"))
++    dt_ = unique(dt_, by = c("stock1", "stock2", "date"))
++    dt_[, ratiospread := close1 / close2]
++    dt_[, spreadclose := log(ratiospread)]
++
++    # Calculate Z scores
++    dt_[, sma20  := frollmean(spreadclose, 20, na.rm = TRUE), by = .(stock1, stock2)]
++    dt_[, sd20   := roll_sd(spreadclose, 20), by = .(stock1, stock2)]
++    dt_[, zscore := (spreadclose - sma20) / sd20]
++
++    # Calculate returns
++    dt_[, logreturns := spreadclose - shift(spreadclose), by = .(stock1, stock1)]
++
++    # DEBUG
++    # dt_[stock1 == "ABB" & stock2 == "ABCB"]
++    # dt_[stock1 == "ABB" & stock2 == "ABCB", .(date, logreturns)]
++    # plot(as.xts.data.table(dt_[stock1 == "PAA" & stock2 == "PAGP", .(date, logreturns)]))
++
++    # Neg lag zscore - this is the weight we apply
++    dt_[, neg_lagged_zscore := shift(-zscore), by = .(stock1, stock2)]
++
++    # Calculate the daily returns of the strategy by multiplying the lagged z-score with the daily returns of the spread
++    dt_[, lsr := neg_lagged_zscore * logreturns]
++
++    # Create month columnd222.138
++    dt_[, month := ceiling_date(date, "month") - 1]
++
++    # Normalize prices by stock1, stock2 and month
++    dt_[, let(
++      normalized1 = close1 / data.table::first(close1),
++      normalized2 = close2 / data.table::first(close2)
++    ), by = .(stock1, stock2, month)]
++
++    # Aggregate to monthly data
++    dtm_ = dt_[, .(lsr = sum(lsr, na.rm = TRUE) / sd(lsr, na.rm = TRUE),
++                   distance = sum((normalized1 - normalized2)^2)),
++               by = .(stock1, stock2, month)]
++
++    # Aggregate to yearly data
++    dtq_ = dtm_[, .(lsr = sum(lsr, na.rm = TRUE),
++                    distance = sum(distance, na.rm = TRUE)),
++                by = .(stock1, stock2)]
++    dtq_[, q := Q - 0.25]
++    pairs_time_series_features_l[[j]] = dtq_
++  }
++  pairs_time_series_features = rbindlist(pairs_time_series_features_l)
++
++  # Ranks
++  pairs_time_series_features[, lsr_rank := frankv(lsr, order = -1L, ties.method = "first"), by = q]
++  pairs_time_series_features[, ed_rank := frank(distance, ties.method = "first"), by = q]
++
++  # Quantile bucketize
++  # pairs_time_series_features[, lsr_bucket := cut(lsr, breaks = quantile(lsr, probs = 0:100/100), labels = 1:100, right = FALSE), by = y]
++  # pairs_time_series_features[, ed_bucket := cut(-distance, breaks = quantile(-distance, probs = 0:100/100), labels = 1:100, right = FALSE), by = y]
++  # pairs_time_series_features[, names(.SD) := lapply(.SD, as.integer), .SDcols = c("lsr_bucket", "ed_bucket")]
++  pairs_time_series_features[, lsr_bucket := .bincode(lsr, breaks = quantile(pairs_time_series_features$lsr, probs = 0:100/100)), by = q]
++  pairs_time_series_features[, ed_bucket  := .bincode(-distance, breaks = quantile(-distance, probs = 0:100/100)), by = q]
++
++  # DEBUG
++  # pairs_time_series_features[stock1 == "PAA" & stock2 == "PAGP"]
++  # pairs_time_series_features[stock1 == "PAGP" & stock2 == "PAA"]
++  # pairs_time_series_features[stock1 == "BEP" & stock2 == "BEPC"]
++  # pairs_time_series_features[stock1 == "BEPC" & stock2 == "BEP"]
++
++  # Merge pairs_time_series_features and
++  pairs_universe_ = merge(pairs_time_series_features, pairs_universe,
++                          by = c("stock1", "stock2", "q"), all.x = TRUE, all.y = FALSE)
++  pairs_universe_l[[i]] = na.omit(pairs_universe_)
++}
++
++# Merge results for all pairs
++pairs_features = rbindlist(pairs_universe_l)
++fwrite(pairs_features, file.path(PATH_SAVE, "pairs_features.csv"))
++
++# Combined scores
++setorder(pairs_features, stock1, stock2, q)
++# Give more weigts to newer data
++test = pairs_features[1:1000] |>
++  _[, .(lsr_bucket, ed_bucket, q, (roll::roll_mean(lsr_bucket, 8, weights = 1:8, min_obs = 8) +
++          roll::roll_mean(ed_bucket, 8, weights = 1:8, min_obs = 8)) / 2), by = .(stock1, stock2)]
++head(test, 20)
++tail(test, 20)
++pairs_features[, combo_score := (roll::roll_mean(lsr_bucket, 8, weights = 1:8, min_obs = 8) +
++                    roll::roll_mean(ed_bucket, 8, weights = 1:8, min_obs = 8)) / 2,
++               by = .(stock1, stock2)]
++
++# Check number of NA's
++pairs_features[, sort(unique((q)))]
++pairs_features[, sum(is.na(combo_score)) / nrow(pairs_features) * 100]
++pairs_features[q > 2023.5][, sum(is.na(combo_score)) / nrow(pairs_features) * 100]
++
++# Convert to wide format by year
++pairs_combo = dcast(pairs_features, stock1 + stock2 + same_sector + same_industry ~ q * 100, value.var = "combo_score")
++
++# # Create combo rank
++# colnames(pairs_features)
++# pairs_features[, let(
++#   combo_score_2024 = (
++#     lsr_bucket_2024 * 3 + ed_bucket_2024 * 3 + lsr_bucket_2023 * 2 +
++#       ed_bucket_2023 * 2 + lsr_bucket_2022 + ed_bucket_2022) / (3 + 3 + 2 + 2 + 1 + 1),
++#   combo_score_2023 = (
++#     lsr_bucket_2023 * 3 + ed_bucket_2023 * 3 + lsr_bucket_2022 * 2 +
++#       ed_bucket_2022 * 2 + lsr_bucket_2021 + ed_bucket_2021) / (3 + 3 + 2 + 2 + 1 + 1),
++#   combo_score_2022 = (
++#     lsr_bucket_2022 * 3 + ed_bucket_2022 * 3 + lsr_bucket_2021 * 2 +
++#       ed_bucket_2021 * 2 + lsr_bucket_2020 + ed_bucket_2020) / (3 + 3 + 2 + 2 + 1 + 1),
++#   combo_score_2021 = (
++#     lsr_bucket_2021 * 3 + ed_bucket_2021 * 3 + lsr_bucket_2020 * 2 +
++#       ed_bucket_2020 * 2 + lsr_bucket_2019 + ed_bucket_2019) / (3 + 3 + 2 + 2 + 1 + 1)
++# )]
++
++# Add data from profiles
++profile[, .(isin  = sum(nzchar(isin)),
++            cik   = sum(nzchar(cik)),
++            cusip = sum(nzchar(cusip)))]
++profile_cols = c("symbol", "isin", "isEtf", "isFund", "companyName", "currency",
++                 "exchange", "country", "sector", "industry")
++profile_meta = profile[, ..profile_cols]
++pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(pairs_combo, profile_cols[-1], c("isin1", "isetf1", "isfund1", "name1", "currency1", "exchange1", "country1",
++                                          "sector1", "industry1"))
++pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(pairs_combo, profile_cols[-1], c("isin2","isetf2", "isfund2", "name2", "currency2", "exchange2", "country2",
++                                          "sector2", "industry2"))
++
++# Save
++fwrite(pairs_combo, file.path(PATH_SAVE, "pairs_combo.csv"))
++
++# Summary
++pairs_combo[, sum(same_industry == 1) / nrow(pairs_combo) * 100]
++
++# Save best
++cols = colnames(pairs_combo)[grepl("^\\d+$", colnames(pairs_combo))]
++cols = c("stock1", "stock2", cols)
++best = pairs_combo[
++  # same_industry == 1 &
++  same_sector == 1 &
++    isfund1 == FALSE & isfund2 == FALSE &
++    isetf1 == FALSE & isetf2 == FALSE &
++    # country1 == country2 &
++    name1 != name2 & isin1 != isin2, ..cols]
++na.omit(best, cols = c("202475"))[order(-`202475`)] # Test
++na.omit(best, cols = c("202500"))[order(-`202500`)] # Test
++best = melt(best, id.vars = c("stock1", "stock2"))
++best = na.omit(best)
++best[1, as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
++best[, q := as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
++best[, variable := NULL]
++setorder(best, q, -value)
++
++# Save best
++fwrite(best, file.path(PATH_SAVE, "pairs_best_q.csv"))
++
++# Save to Azure
++bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                               Sys.getenv("BLOB-KEY"))
++cont = storage_container(bl_endp_key, "qc-backtest")
++storage_write_csv(as.data.frame(best), cont, "pairs_best_q.csv")
++
++# Checks
++best[stock1 == "PAA" & stock2 == "PAGP"]
++best[stock1 == "BEP" & stock2 == "BEPC"]
++best[stock1 == "MCO" & stock2 == "SPGI"]
++best[stock1 == "ASB" & stock2 == "HBAN"]
++best[stock1 == "KNX" & stock2 == "WERN"]
++best[stock1 == "LADR" & stock2 == "RITM"]
++
++
++
++# DEEP ANALYSE ------------------------------------------------------------
++# Check best
++best_ = merge(best, pairs_combo[, .(stock1, stock2, exchange1, exchange2,
++                                    country1, country2, currency1, currency2,
++                                    same_sector)],
++              by = c("stock1", "stock2"), all.x = TRUE, all.y = FALSE)
++best_ = merge(best_, profile_sample,
++              by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(best_, c("sector", "industry"), c("sector1", "industry1"))
++best_ = merge(best_, profile_sample,
++              by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(best_, c("sector", "industry"), c("sector2", "industry2"))
++
++
+diff --git a/rw_prepare_2025.R b/rw_prepare_2025.R
+new file mode 100644
+index 0000000..0af8922
+--- /dev/null
++++ b/rw_prepare_2025.R
+@@ -0,0 +1,332 @@
++library(fastverse)
++library(finutils)
++library(ggplot2)
++library(arrow)
++library(httr)
++library(roll)
++library(lubridate)
++library(AzureStor)
++
++
++# SETUP -------------------------------------------------------------------
++# Save path
++PATH_SAVE = "D:/strategies/statsarb"
++
++
++# DATA --------------------------------------------------------------------
++# Import daily data
++prices = coarse(
++  min_mean_mon_price = 5,
++  min_mean_mon_volume = 100000,
++  dollar_vol_n = 3000,
++  file_path = "F:/lean/data/all_stocks_daily",
++  min_obs = 2 * 252,
++  price_threshold = 1e-008,
++  duplicates = "fast",
++  add_dv_rank = FALSE,
++  add_day_of_month = FALSE,
++  etfs = FALSE,
++  profiles_fmp = TRUE,
++  fmp_api_key = "6c390b6279b8a67cc7f63cbecbd69430"
++)
++
++# Create quaterly column
++prices[, q := data.table::yearqtr(date)]
++
++# Plots
++quarters = prices[, sort(unique(q))]
++prices[, .N, by = q][order(q)] |>
++  ggplot(aes(q, N)) +
++  geom_col() +
++  scale_x_binned(breaks = quarters)
++
++# Metadata for every stock
++profile = unique(prices[, .(fmp_symbol, industry, sector, isEtf, isFund)])
++
++
++# PAIRS -------------------------------------------------------------------
++# Create pairs for every quarter
++pairs_universe = list()
++for (i in seq_along(quarters)) {
++  print(i)
++  # data
++  q_ = quarters[i]
++  dt_ = prices[q == q_]
++
++  # Remove symbols with low number of observations
++  keep_symbols = dt_[, .N, by = symbol][N > 40, symbol]
++  sprintf("Keeping %d symbols out of %d (%.1f%%)", length(keep_symbols), dt_[, length(unique(symbol))],
++          100 * length(keep_symbols) / dt_[, length(unique(symbol))])
++  dt_ = dt_[symbol %in% keep_symbols]
++
++  # create all possible pairs
++  pairs_all = dt_[, unique(fmp_symbol)]
++  pairs_all = CJ(stock1 = pairs_all, stock2 = pairs_all, unique = TRUE)
++  pairs_all = pairs_all[stock1 != stock2]
++  pairs_all[, `:=`(first = pmin(stock1, stock2), second = pmax(stock1, stock2))]
++  pairs_all = unique(pairs_all, by = c("first", "second"))
++  pairs_all[, c("first", "second") := NULL]
++
++  # Merge industries and sectors for each stock in the pair
++  pairs_all = merge(pairs_all, profile, by.x = "stock1", by.y = "fmp_symbol")
++  cols = c("sector", "industry", "isEtf", "isFund")
++  setnames(pairs_all, cols, paste0(cols, "_stock1"))
++  pairs_all = merge(pairs_all, profile, by.x = "stock2", by.y = "fmp_symbol")
++  setnames(pairs_all, cols, paste0(cols, "_stock2"))
++  pairs_all[, same_sector := 0]
++  pairs_all[sector_stock1 == sector_stock2, same_sector := 1]
++  # pairs_all = merge(pairs_all, profile, by.x = "stock2", by.y = "fmp_symbol")
++  pairs_all[, same_industry := 0]
++  pairs_all[industry_stock1 == industry_stock2, same_industry := 1]
++  pairs_all = pairs_all[, .(stock1, stock2, same_sector, same_industry)]
++
++  # merge year and save to list
++  pairs_all[, q := q_]
++  pairs_universe[[i]] = pairs_all
++}
++pairs_universe = rbindlist(pairs_universe)
++# 51.1582.065
++#
++setorder(pairs_universe, q)
++nrow(pairs_universe)
++
++
++# TIME SERIES FEATURES ----------------------------------------------------
++# TODO: Choose year, but later maybe expand for all years
++# YEARS = 2020:2025
++QUARTERS = prices_coarse[, sort(unique(q))]
++STARTY   = 2022
++pairs_universe_l = list()
++for (i in seq_along(QUARTERS)) {
++  # Extract year
++  # i = 80
++  print(i)
++
++  # Choose last quartal
++  Q = QUARTERS[i]
++
++  # Test if qaurter in set
++  if (QUARTERS[i] < STARTY) {
++    pairs_universe_l[[i]] = NULL
++    next
++  }
++
++  # Extract last 4 quarters
++  # qs = QUARTERS[(i - 5):(i - 1)]
++
++  # Spreads
++  pairsy = pairs_universe[q == Q]
++
++  # DEBUG
++  # pairsy[stock1 == "PAA" & stock2 == "PAGP"]
++  # pairsy[stock1 == "BEP" & stock2 == "BEPC"]
++  # pairsy[stock1 == "MCO" & stock2 == "SPGI"]
++  # pairsy[stock1 == "ASB" & stock2 == "HBAN"]
++  # pairsy[stock1 == "KNX" & stock2 == "WERN"]
++  # chunks = pairsy[(stock1 == "PAA" & stock2 == "PAGP") |
++  #                   (stock1 == "BEP" & stock2 == "BEPC")]
++  # dt_ = copy(chunks)
++
++  # Divide number of rows of pairs universe to 100 chunks
++  chunks = split(pairsy, cut(1:nrow(pairsy), breaks = 75))
++
++  # Loop over chunks to calcluate time series features
++  pairs_time_series_features_l = list()
++  for (j in seq_along(chunks)) {
++    # j = 1
++    print(j)
++    # Prepare chunk
++    dt_ = chunks[[j]]
++    dt_ = dt_[, .(stock1, stock2)]
++    start_date = zoo::as.Date.yearqtr(Q-0.25) - 365 - 30
++    end_date   = zoo::as.Date.yearqtr(Q-0.25)
++    dates = prices[date %between% c(start_date, end_date), sort(unique(date))]
++    dt_ = dt_[, .(date = dates), by = .(stock1, stock2)]
++
++    # Merge prices with pairs and dates
++    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock1", "date")]
++    setnames(dt_, c("fmp_ticker", "close"), c("stock1", "close1"))
++    dt_ = prices[, .(fmp_ticker, date, close)][dt_, on = c("fmp_ticker" = "stock2", "date")]
++    setnames(dt_, c("fmp_ticker", "close"), c("stock2", "close2"))
++    dt_ = unique(dt_, by = c("stock1", "stock2", "date"))
++    dt_[, ratiospread := close1 / close2]
++    dt_[, spreadclose := log(ratiospread)]
++
++    # Calculate Z scores
++    dt_[, sma20  := frollmean(spreadclose, 20, na.rm = TRUE), by = .(stock1, stock2)]
++    dt_[, sd20   := roll_sd(spreadclose, 20), by = .(stock1, stock2)]
++    dt_[, zscore := (spreadclose - sma20) / sd20]
++
++    # Calculate returns
++    dt_[, logreturns := spreadclose - shift(spreadclose), by = .(stock1, stock1)]
++
++    # DEBUG
++    # dt_[stock1 == "ABB" & stock2 == "ABCB"]
++    # dt_[stock1 == "ABB" & stock2 == "ABCB", .(date, logreturns)]
++    # plot(as.xts.data.table(dt_[stock1 == "PAA" & stock2 == "PAGP", .(date, logreturns)]))
++
++    # Neg lag zscore - this is the weight we apply
++    dt_[, neg_lagged_zscore := shift(-zscore), by = .(stock1, stock2)]
++
++    # Calculate the daily returns of the strategy by multiplying the lagged z-score with the daily returns of the spread
++    dt_[, lsr := neg_lagged_zscore * logreturns]
++
++    # Create month columnd222.138
++    dt_[, month := ceiling_date(date, "month") - 1]
++
++    # Normalize prices by stock1, stock2 and month
++    dt_[, let(
++      normalized1 = close1 / data.table::first(close1),
++      normalized2 = close2 / data.table::first(close2)
++    ), by = .(stock1, stock2, month)]
++
++    # Aggregate to monthly data
++    dtm_ = dt_[, .(lsr = sum(lsr, na.rm = TRUE) / sd(lsr, na.rm = TRUE),
++                   distance = sum((normalized1 - normalized2)^2)),
++               by = .(stock1, stock2, month)]
++
++    # Aggregate to yearly data
++    dtq_ = dtm_[, .(lsr = sum(lsr, na.rm = TRUE),
++                    distance = sum(distance, na.rm = TRUE)),
++                by = .(stock1, stock2)]
++    dtq_[, q := Q - 0.25]
++    pairs_time_series_features_l[[j]] = dtq_
++  }
++  pairs_time_series_features = rbindlist(pairs_time_series_features_l)
++
++  # Ranks
++  pairs_time_series_features[, lsr_rank := frankv(lsr, order = -1L, ties.method = "first"), by = q]
++  pairs_time_series_features[, ed_rank := frank(distance, ties.method = "first"), by = q]
++
++  # Quantile bucketize
++  # pairs_time_series_features[, lsr_bucket := cut(lsr, breaks = quantile(lsr, probs = 0:100/100), labels = 1:100, right = FALSE), by = y]
++  # pairs_time_series_features[, ed_bucket := cut(-distance, breaks = quantile(-distance, probs = 0:100/100), labels = 1:100, right = FALSE), by = y]
++  # pairs_time_series_features[, names(.SD) := lapply(.SD, as.integer), .SDcols = c("lsr_bucket", "ed_bucket")]
++  pairs_time_series_features[, lsr_bucket := .bincode(lsr, breaks = quantile(pairs_time_series_features$lsr, probs = 0:100/100)), by = q]
++  pairs_time_series_features[, ed_bucket  := .bincode(-distance, breaks = quantile(-distance, probs = 0:100/100)), by = q]
++
++  # DEBUG
++  # pairs_time_series_features[stock1 == "PAA" & stock2 == "PAGP"]
++  # pairs_time_series_features[stock1 == "PAGP" & stock2 == "PAA"]
++  # pairs_time_series_features[stock1 == "BEP" & stock2 == "BEPC"]
++  # pairs_time_series_features[stock1 == "BEPC" & stock2 == "BEP"]
++
++  # Merge pairs_time_series_features and
++  pairs_universe_ = merge(pairs_time_series_features, pairs_universe,
++                          by = c("stock1", "stock2", "q"), all.x = TRUE, all.y = FALSE)
++  pairs_universe_l[[i]] = na.omit(pairs_universe_)
++}
++
++# Merge results for all pairs
++pairs_features = rbindlist(pairs_universe_l)
++fwrite(pairs_features, file.path(PATH_SAVE, "pairs_features.csv"))
++
++# Combined scores
++setorder(pairs_features, stock1, stock2, q)
++# Give more weigts to newer data
++test = pairs_features[1:1000] |>
++  _[, .(lsr_bucket, ed_bucket, q, (roll::roll_mean(lsr_bucket, 8, weights = 1:8, min_obs = 8) +
++                                     roll::roll_mean(ed_bucket, 8, weights = 1:8, min_obs = 8)) / 2), by = .(stock1, stock2)]
++head(test, 20)
++tail(test, 20)
++pairs_features[, combo_score := (roll::roll_mean(lsr_bucket, 8, weights = 1:8, min_obs = 8) +
++                                   roll::roll_mean(ed_bucket, 8, weights = 1:8, min_obs = 8)) / 2,
++               by = .(stock1, stock2)]
++
++# Check number of NA's
++pairs_features[, sort(unique((q)))]
++pairs_features[, sum(is.na(combo_score)) / nrow(pairs_features) * 100]
++pairs_features[q > 2023.5][, sum(is.na(combo_score)) / nrow(pairs_features) * 100]
++
++# Convert to wide format by year
++pairs_combo = dcast(pairs_features, stock1 + stock2 + same_sector + same_industry ~ q * 100, value.var = "combo_score")
++
++# # Create combo rank
++# colnames(pairs_features)
++# pairs_features[, let(
++#   combo_score_2024 = (
++#     lsr_bucket_2024 * 3 + ed_bucket_2024 * 3 + lsr_bucket_2023 * 2 +
++#       ed_bucket_2023 * 2 + lsr_bucket_2022 + ed_bucket_2022) / (3 + 3 + 2 + 2 + 1 + 1),
++#   combo_score_2023 = (
++#     lsr_bucket_2023 * 3 + ed_bucket_2023 * 3 + lsr_bucket_2022 * 2 +
++#       ed_bucket_2022 * 2 + lsr_bucket_2021 + ed_bucket_2021) / (3 + 3 + 2 + 2 + 1 + 1),
++#   combo_score_2022 = (
++#     lsr_bucket_2022 * 3 + ed_bucket_2022 * 3 + lsr_bucket_2021 * 2 +
++#       ed_bucket_2021 * 2 + lsr_bucket_2020 + ed_bucket_2020) / (3 + 3 + 2 + 2 + 1 + 1),
++#   combo_score_2021 = (
++#     lsr_bucket_2021 * 3 + ed_bucket_2021 * 3 + lsr_bucket_2020 * 2 +
++#       ed_bucket_2020 * 2 + lsr_bucket_2019 + ed_bucket_2019) / (3 + 3 + 2 + 2 + 1 + 1)
++# )]
++
++# Add data from profiles
++profile[, .(isin  = sum(nzchar(isin)),
++            cik   = sum(nzchar(cik)),
++            cusip = sum(nzchar(cusip)))]
++profile_cols = c("symbol", "isin", "isEtf", "isFund", "companyName", "currency",
++                 "exchange", "country", "sector", "industry")
++profile_meta = profile[, ..profile_cols]
++pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(pairs_combo, profile_cols[-1], c("isin1", "isetf1", "isfund1", "name1", "currency1", "exchange1", "country1",
++                                          "sector1", "industry1"))
++pairs_combo = merge(pairs_combo, profile_meta, by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(pairs_combo, profile_cols[-1], c("isin2","isetf2", "isfund2", "name2", "currency2", "exchange2", "country2",
++                                          "sector2", "industry2"))
++
++# Save
++fwrite(pairs_combo, file.path(PATH_SAVE, "pairs_combo.csv"))
++
++# Summary
++pairs_combo[, sum(same_industry == 1) / nrow(pairs_combo) * 100]
++
++# Save best
++cols = colnames(pairs_combo)[grepl("^\\d+$", colnames(pairs_combo))]
++cols = c("stock1", "stock2", cols)
++best = pairs_combo[
++  # same_industry == 1 &
++  same_sector == 1 &
++    isfund1 == FALSE & isfund2 == FALSE &
++    isetf1 == FALSE & isetf2 == FALSE &
++    # country1 == country2 &
++    name1 != name2 & isin1 != isin2, ..cols]
++na.omit(best, cols = c("202475"))[order(-`202475`)] # Test
++na.omit(best, cols = c("202500"))[order(-`202500`)] # Test
++best = melt(best, id.vars = c("stock1", "stock2"))
++best = na.omit(best)
++best[1, as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
++best[, q := as.numeric(paste0(substr(as.character(variable), 1, 4), ".", substr(as.character(variable), 5, 6)))]
++best[, variable := NULL]
++setorder(best, q, -value)
++
++# Save best
++fwrite(best, file.path(PATH_SAVE, "pairs_best_q.csv"))
++
++# Save to Azure
++bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                               Sys.getenv("BLOB-KEY"))
++cont = storage_container(bl_endp_key, "qc-backtest")
++storage_write_csv(as.data.frame(best), cont, "pairs_best_q.csv")
++
++# Checks
++best[stock1 == "PAA" & stock2 == "PAGP"]
++best[stock1 == "BEP" & stock2 == "BEPC"]
++best[stock1 == "MCO" & stock2 == "SPGI"]
++best[stock1 == "ASB" & stock2 == "HBAN"]
++best[stock1 == "KNX" & stock2 == "WERN"]
++best[stock1 == "LADR" & stock2 == "RITM"]
++
++
++
++# DEEP ANALYSE ------------------------------------------------------------
++# Check best
++best_ = merge(best, pairs_combo[, .(stock1, stock2, exchange1, exchange2,
++                                    country1, country2, currency1, currency2,
++                                    same_sector)],
++              by = c("stock1", "stock2"), all.x = TRUE, all.y = FALSE)
++best_ = merge(best_, profile_sample,
++              by.x = "stock1", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(best_, c("sector", "industry"), c("sector1", "industry1"))
++best_ = merge(best_, profile_sample,
++              by.x = "stock2", by.y = "symbol", all.x = TRUE, all.y = FALSE)
++setnames(best_, c("sector", "industry"), c("sector2", "industry2"))
++
++
+diff --git a/rwpairs/pairs_shortlist_2025.csv b/rwpairs/pairs_shortlist_2025.csv
+new file mode 100644
+index 0000000..938f6d7
+--- /dev/null
++++ b/rwpairs/pairs_shortlist_2025.csv
+@@ -0,0 +1,101 @@
++﻿stock1,stock2,sector,industry,category1,category2,location1,location2,currency1,currency2,isLassoApproved,rank_score,lsr_percentile_2024,lsr_percentile_2023,lsr_percentile_2022,ed_percentile_2024,ed_percentile_2023,ed_percentile_2022
++PAA,PAGP,Energy,Oil & Gas Midstream,PLAINS ALL AMERICAN PIPELINE LP,PLAINS GP HOLDINGS LP,Texas; U.S.A,Texas; U.S.A,USD,USD,FALSE,99.8,100,99,100,100,100,100
++BEP,BEPC,Utilities,Utilities - Renewable,BROOKFIELD RENEWABLE PARTNERS LP,BROOKFIELD RENEWABLE CORP,Bermuda,New York; U.S.A,USD,USD,TRUE,98.5,97,100,95,99,99,100
++MCO,SPGI,Financial Services,Financial Data & Stock Exchanges,MOODYS CORP,S&P GLOBAL INC,New York; U.S.A,New York; U.S.A,USD,USD,TRUE,98.5,97,98,98,100,99,99
++ASB,HBAN,Financial Services,Banks - Regional,ASSOCIATED BANC-CORP,HUNTINGTON BANCSHARES INC,Wisconsin; U.S.A,Ohio; U.S.A,USD,USD,FALSE,98.5,99,99,98,99,97,99
++KNX,WERN,Industrials,Trucking,KNIGHT-SWIFT TRANSPORTATION HOLDINGS INC,WERNER ENTERPRISES INC,Arizona; U.S.A,Nebraska; U.S.A,USD,USD,TRUE,98.4,96,99,99,99,99,99
++FTS,LNT,Utilities,Utilities - Regulated Electric,FORTIS INC,ALLIANT ENERGY CORP,Newfoundland; Canada,Wisconsin; U.S.A,USD,USD,FALSE,98.4,100,97,94,99,99,100
++LADR,RITM,Real Estate,REIT - Mortgage,LADDER CAPITAL CORP,RITHM CAPITAL CORP,New York; U.S.A,New York; U.S.A,USD,USD,FALSE,98.3,99,98,92,100,99,99
++HBAN,WTFC,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,WINTRUST FINANCIAL CORP,Ohio; U.S.A,Illinois; U.S.A,USD,USD,FALSE,97.9,100,94,98,99,98,99
++AM,WES,Energy,Oil & Gas Midstream,ANTERO MIDSTREAM CORP,WESTERN MIDSTREAM PARTNERS LP,Colorado; U.S.A,Texas; U.S.A,USD,USD,FALSE,97.8,96,100,95,99,98,97
++ARCC,TSLX,Financial Services,Asset Management,ARES CAPITAL CORP,SIXTH STREET SPECIALTY LENDING INC,New York; U.S.A,Texas; U.S.A,USD,USD,TRUE,97.6,91,99,99,100,99,99
++ABCB,CADE,Financial Services,Banks - Regional,AMERIS BANCORP,CADENCE BANK,Georgia; U.S.A,Mississippi; U.S.A,USD,USD,FALSE,97.4,94,97,99,99,98,99
++CADE,HOPE,Financial Services,Banks - Regional,CADENCE BANK,HOPE BANCORP INC,Mississippi; U.S.A,California; U.S.A,USD,USD,FALSE,97.3,98,100,85,99,98,98
++CMS,FTS,Utilities,Utilities - Regulated Electric,CMS ENERGY CORP,FORTIS INC,Michigan; U.S.A,Newfoundland; Canada,USD,USD,FALSE,97.3,100,91,95,99,99,100
++CADE,HBAN,Financial Services,Banks - Regional,CADENCE BANK,HUNTINGTON BANCSHARES INC,Mississippi; U.S.A,Ohio; U.S.A,USD,USD,FALSE,97.2,97,94,99,99,97,99
++FFBC,ONB,Financial Services,Banks - Regional,FIRST FINANCIAL BANCORP,OLD NATIONAL BANCORP,Ohio; U.S.A,Indiana; U.S.A,USD,USD,FALSE,97.2,95,92,100,100,99,100
++FTS,OGE,Utilities,Utilities - Regulated Electric,FORTIS INC,OGE ENERGY CORP,Newfoundland; Canada,Oklahoma; U.S.A,USD,USD,FALSE,97.1,99,97,83,99,99,100
++BSM,CTRA,Energy,Oil & Gas E&P,BLACK STONE MINERALS LP,COTERRA ENERGY INC,Texas; U.S.A,Texas; U.S.A,USD,USD,FALSE,96.6,99,99,96,96,98,86
++CADE,USB,Financial Services,Banks - Regional,CADENCE BANK,US BANCORP,Mississippi; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,96.6,100,100,76,99,98,96
++HBAN,SNV,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,SYNOVUS FINANCIAL CORP,Ohio; U.S.A,Georgia; U.S.A,USD,USD,FALSE,96.6,100,90,96,98,98,98
++DTM,WMB,Energy,Oil & Gas Midstream,DT MIDSTREAM INC,WILLIAMS COMPANIES INC,Michigan; U.S.A,Oklahoma; U.S.A,USD,USD,FALSE,96.5,92,98,90,99,99,99
++DRH,HST,Real Estate,REIT - Hotel & Motel,DIAMONDROCK HOSPITALITY CO,HOST HOTELS & RESORTS INC,Maryland; U.S.A,Maryland; U.S.A,USD,USD,FALSE,96.5,99,87,98,100,98,99
++CMI,ITW,Industrials,Specialty Industrial Machinery,CUMMINS INC,ILLINOIS TOOL WORKS INC,Indiana; U.S.A,Illinois; U.S.A,USD,USD,FALSE,96.5,95,94,96,98,98,99
++HBAN,WBS,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,WEBSTER FINANCIAL CORP,Ohio; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,96.2,89,97,97,99,98,99
++QGEN,TMO,Healthcare,Diagnostics & Research,QIAGEN NV,THERMO FISHER SCIENTIFIC INC,Netherlands,Massachusetts; U.S.A,USD,USD,FALSE,96.2,95,90,99,99,99,97
++FTS,WEC,Utilities,Utilities - Regulated Electric,FORTIS INC,WEC ENERGY GROUP INC,Newfoundland; Canada,Wisconsin; U.S.A,USD,USD,FALSE,95.9,99,86,91,100,99,100
++ET,MPLX,Energy,Oil & Gas Midstream,ENERGY TRANSFER LP,MPLX LP,Texas; U.S.A,Ohio; U.S.A,USD,USD,FALSE,95.8,94,88,99,99,99,99
++HOPE,USB,Financial Services,Banks - Regional,HOPE BANCORP INC,US BANCORP,California; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,95.8,98,91,94,98,96,98
++CADE,WBS,Financial Services,Banks - Regional,CADENCE BANK,WEBSTER FINANCIAL CORP,Mississippi; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,95.4,93,89,98,99,98,98
++DHR,TMO,Healthcare,Diagnostics & Research,DANAHER CORP,THERMO FISHER SCIENTIFIC INC,District Of Columbia; U.S.A,Massachusetts; U.S.A,USD,USD,TRUE,95.4,86,96,94,99,99,100
++PB,PNC,Financial Services,Banks - Regional,PROSPERITY BANCSHARES INC,PNC FINANCIAL SERVICES GROUP INC,Texas; U.S.A,Pennsylvania; U.S.A,USD,USD,FALSE,95.4,99,93,75,100,98,99
++OZK,WBS,Financial Services,Banks - Regional,BANK OF THE OZARKS INC,WEBSTER FINANCIAL CORP,Arkansas; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,95.4,92,96,100,95,95,98
++FFBC,HOMB,Financial Services,Banks - Regional,FIRST FINANCIAL BANCORP,HOME BANCSHARES INC,Ohio; U.S.A,Arkansas; U.S.A,USD,USD,FALSE,95.3,100,95,68,100,98,99
++SBCF,USB,Financial Services,Banks - Regional,SEACOAST BANKING CORP OF FLORIDA,US BANCORP,Florida; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,95.3,97,91,89,99,96,98
++DFS,OMF,Financial Services,Credit Services,DISCOVER FINANCIAL SERVICES,ONEMAIN HOLDINGS INC,Illinois; U.S.A,Indiana; U.S.A,USD,USD,FALSE,95.3,97,93,97,96,93,98
++CPB,FLO,Consumer Defensive,Packaged Foods,CAMPBELL'S CO,FLOWERS FOODS INC,New Jersey; U.S.A,Georgia; U.S.A,USD,USD,TRUE,95.3,100,92,81,99,96,98
++KEY,USB,Financial Services,Banks - Regional,KEYCORP,US BANCORP,Ohio; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,95.1,100,85,94,99,95,99
++CMI,DOV,Industrials,Specialty Industrial Machinery,CUMMINS INC,DOVER CORP,Indiana; U.S.A,Illinois; U.S.A,USD,USD,FALSE,95.1,97,90,89,99,96,98
++KEY,WBS,Financial Services,Banks - Regional,KEYCORP,WEBSTER FINANCIAL CORP,Ohio; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,95,98,89,92,97,96,98
++COLB,VBTX,Financial Services,Banks - Regional,COLUMBIA BANKING SYSTEM INC,VERITEX HOLDINGS INC,Washington; U.S.A,Texas; U.S.A,USD,USD,FALSE,94.9,86,96,95,97,99,98
++ARCC,NMFC,Financial Services,Asset Management,ARES CAPITAL CORP,NEW MOUNTAIN FINANCE CORP,New York; U.S.A,New York; U.S.A,USD,USD,TRUE,94.8,78,100,97,99,99,99
++DUK,EIX,Utilities,Utilities - Regulated Electric,DUKE ENERGY CORP,EDISON INTERNATIONAL,North Carolina; U.S.A,California; U.S.A,USD,USD,TRUE,94.7,97,89,80,99,99,99
++AEE,FTS,Utilities,Utilities - Regulated Electric,AMEREN CORP,FORTIS INC,Missouri; U.S.A,Newfoundland; Canada,USD,USD,FALSE,94.6,80,97,98,99,98,100
++CADE,FHB,Financial Services,Banks - Regional,CADENCE BANK,FIRST HAWAIIAN INC,Mississippi; U.S.A,Hawaii; U.S.A,USD,USD,FALSE,94.6,97,90,80,99,98,98
++EBC,SBCF,Financial Services,Banks - Regional,EASTERN BANKSHARES INC,SEACOAST BANKING CORP OF FLORIDA,Massachusetts; U.S.A,Florida; U.S.A,USD,USD,FALSE,94.6,90,92,90,99,98,98
++LNT,OGE,Utilities,Utilities - Regulated Electric,ALLIANT ENERGY CORP,OGE ENERGY CORP,Wisconsin; U.S.A,Oklahoma; U.S.A,USD,USD,TRUE,94.6,84,90,98,100,100,100
++BLK,JHG,Financial Services,Asset Management,BLACKROCK INC,JANUS HENDERSON GROUP PLC,New York; U.S.A,United Kingdom,USD,USD,FALSE,94.5,89,100,96,99,90,93
++NWBI,UBSI,Financial Services,Banks - Regional,NORTHWEST BANCSHARES INC,UNITED BANKSHARES INC,Pennsylvania; U.S.A,West Virginia; U.S.A,USD,USD,FALSE,94.5,96,89,80,100,98,99
++PNC,SBCF,Financial Services,Banks - Regional,PNC FINANCIAL SERVICES GROUP INC,SEACOAST BANKING CORP OF FLORIDA,Pennsylvania; U.S.A,Florida; U.S.A,USD,USD,FALSE,94.4,98,89,84,99,95,98
++HLI,SF,Financial Services,Capital Markets,HOULIHAN LOKEY INC,STIFEL FINANCIAL CORP,California; U.S.A,Missouri; U.S.A,USD,USD,FALSE,94.4,97,95,72,99,97,96
++HBAN,OZK,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,BANK OF THE OZARKS INC,Ohio; U.S.A,Arkansas; U.S.A,USD,USD,FALSE,94.4,81,97,100,99,96,98
++HWC,USB,Financial Services,Banks - Regional,HANCOCK WHITNEY CORP,US BANCORP,Mississippi; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,94.4,93,90,89,99,97,97
++ASB,CADE,Financial Services,Banks - Regional,ASSOCIATED BANC-CORP,CADENCE BANK,Wisconsin; U.S.A,Mississippi; U.S.A,USD,USD,FALSE,94.4,100,82,89,99,97,99
++COF,OMF,Financial Services,Credit Services,CAPITAL ONE FINANCIAL CORP,ONEMAIN HOLDINGS INC,Virginia; U.S.A,Indiana; U.S.A,USD,USD,TRUE,94.4,100,80,99,99,94,99
++HBAN,USB,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,US BANCORP,Ohio; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,94.4,96,89,82,99,98,98
++CADE,ONB,Financial Services,Banks - Regional,CADENCE BANK,OLD NATIONAL BANCORP,Mississippi; U.S.A,Indiana; U.S.A,USD,USD,FALSE,94.4,96,91,78,99,98,98
++CMA,USB,Financial Services,Banks - Regional,COMERICA INC,US BANCORP,Texas; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,94.3,93,97,89,96,92,98
++CADE,RF,Financial Services,Banks - Regional,CADENCE BANK,REGIONS FINANCIAL CORP,Mississippi; U.S.A,Alabama; U.S.A,USD,USD,FALSE,94.2,99,84,88,99,96,98
++AGCO,DE,Industrials,Farm & Heavy Construction Machinery,AGCO CORP,DEERE & CO,Georgia; U.S.A,Illinois; U.S.A,USD,USD,TRUE,94.1,87,95,89,97,99,96
++HWC,OZK,Financial Services,Banks - Regional,HANCOCK WHITNEY CORP,BANK OF THE OZARKS INC,Mississippi; U.S.A,Arkansas; U.S.A,USD,USD,FALSE,94.1,93,89,86,99,97,99
++USB,WTFC,Financial Services,Banks - Regional,US BANCORP,WINTRUST FINANCIAL CORP,Minnesota; U.S.A,Illinois; U.S.A,USD,USD,FALSE,94.1,93,96,76,97,98,97
++CUBE,FR,Real Estate,REIT - Industrial,CUBESMART,FIRST INDUSTRIAL REALTY TRUST INC,Pennsylvania; U.S.A,Illinois; U.S.A,USD,USD,FALSE,94,86,99,81,97,98,99
++CUBE,REXR,Real Estate,REIT - Industrial,CUBESMART,REXFORD INDUSTRIAL REALTY INC,Pennsylvania; U.S.A,California; U.S.A,USD,USD,FALSE,94,98,96,62,98,98,98
++ICE,SPGI,Financial Services,Financial Data & Stock Exchanges,INTERCONTINENTAL EXCHANGE INC,S&P GLOBAL INC,Georgia; U.S.A,New York; U.S.A,USD,USD,FALSE,94,95,87,90,98,96,98
++PPBI,WBS,Financial Services,Banks - Regional,PACIFIC PREMIER BANCORP INC,WEBSTER FINANCIAL CORP,California; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,93.9,93,93,84,96,96,99
++PPBI,VLY,Financial Services,Banks - Regional,PACIFIC PREMIER BANCORP INC,VALLEY NATIONAL BANCORP,California; U.S.A,New York; U.S.A,USD,USD,FALSE,93.9,95,92,76,98,97,99
++GBDC,TSLX,Financial Services,Asset Management,GOLUB CAPITAL BDC INC,SIXTH STREET SPECIALTY LENDING INC,New York; U.S.A,Texas; U.S.A,USD,USD,FALSE,93.9,84,91,91,100,99,100
++RF,USB,Financial Services,Banks - Regional,REGIONS FINANCIAL CORP,US BANCORP,Alabama; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,93.9,97,80,92,100,97,99
++GSK,SNY,Healthcare,Drug Manufacturers - General,GSK PLC,SANOFI,United Kingdom,France,USD,USD,TRUE,93.9,84,90,98,99,98,99
++FHB,USB,Financial Services,Banks - Regional,FIRST HAWAIIAN INC,US BANCORP,Hawaii; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,93.8,83,98,83,99,98,99
++SBCF,TFC,Financial Services,Banks - Regional,SEACOAST BANKING CORP OF FLORIDA,TRUIST FINANCIAL CORP,Florida; U.S.A,North Carolina; U.S.A,USD,USD,FALSE,93.8,89,98,93,98,88,99
++EIX,FTS,Utilities,Utilities - Regulated Electric,EDISON INTERNATIONAL,FORTIS INC,California; U.S.A,Newfoundland; Canada,USD,USD,FALSE,93.7,99,92,62,99,98,99
++HOPE,SBCF,Financial Services,Banks - Regional,HOPE BANCORP INC,SEACOAST BANKING CORP OF FLORIDA,California; U.S.A,Florida; U.S.A,USD,USD,FALSE,93.7,99,75,96,99,98,99
++BCS,C,Financial Services,Banks - Diversified,BARCLAYS PLC,CITIGROUP INC,United Kingdom,New York; U.S.A,USD,USD,FALSE,93.7,96,91,95,89,96,98
++CADE,FFBC,Financial Services,Banks - Regional,CADENCE BANK,FIRST FINANCIAL BANCORP,Mississippi; U.S.A,Ohio; U.S.A,USD,USD,FALSE,93.7,95,92,72,99,97,99
++HBAN,SFNC,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,SIMMONS FIRST NATIONAL CORP,Ohio; U.S.A,Arkansas; U.S.A,USD,USD,FALSE,93.7,94,92,90,96,92,99
++LADR,STWD,Real Estate,REIT - Mortgage,LADDER CAPITAL CORP,STARWOOD PROPERTY TRUST INC,New York; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,93.7,95,80,92,100,98,99
++CUBE,PLD,Real Estate,REIT - Industrial,CUBESMART,PROLOGIS INC,Pennsylvania; U.S.A,California; U.S.A,USD,USD,FALSE,93.7,82,99,88,97,99,95
++SNV,USB,Financial Services,Banks - Regional,SYNOVUS FINANCIAL CORP,US BANCORP,Georgia; U.S.A,Minnesota; U.S.A,USD,USD,FALSE,93.7,91,89,92,96,98,97
++ECL,PPG,Basic Materials,Specialty Chemicals,ECOLAB INC,PPG INDUSTRIES INC,Minnesota; U.S.A,Pennsylvania; U.S.A,USD,USD,FALSE,93.6,92,94,72,98,99,98
++HOMB,PNC,Financial Services,Banks - Regional,HOME BANCSHARES INC,PNC FINANCIAL SERVICES GROUP INC,Arkansas; U.S.A,Pennsylvania; U.S.A,USD,USD,FALSE,93.6,100,76,91,100,97,99
++EXC,FE,Utilities,Utilities - Regulated Electric,EXELON CORP,FIRSTENERGY CORP,Illinois; U.S.A,Ohio; U.S.A,USD,USD,TRUE,93.6,89,87,87,100,99,99
++BXSL,TSLX,Financial Services,Asset Management,BLACKSTONE SECURED LENDING FUND,SIXTH STREET SPECIALTY LENDING INC,New York; U.S.A,Texas; U.S.A,USD,USD,FALSE,93.5,79,91,99,100,99,98
++CHKP,DOX,Technology,Software - Infrastructure,CHECK POINT SOFTWARE TECHNOLOGIES LTD,AMDOCS LTD,Israel,United Kingdom,USD,USD,FALSE,93.5,95,94,71,97,98,96
++AMP,APO,Financial Services,Asset Management,AMERIPRISE FINANCIAL INC,APOLLO GLOBAL MANAGEMENT INC,Minnesota; U.S.A,New York; U.S.A,USD,USD,FALSE,93.5,93,94,85,94,98,92
++PMT,STWD,Real Estate,REIT - Mortgage,PENNYMAC MORTGAGE INVESTMENT TRUST,STARWOOD PROPERTY TRUST INC,California; U.S.A,Connecticut; U.S.A,USD,USD,FALSE,93.4,100,100,43,100,97,97
++FFBC,PNC,Financial Services,Banks - Regional,FIRST FINANCIAL BANCORP,PNC FINANCIAL SERVICES GROUP INC,Ohio; U.S.A,Pennsylvania; U.S.A,USD,USD,FALSE,93.4,96,92,72,99,95,98
++CADE,FULT,Financial Services,Banks - Regional,CADENCE BANK,FULTON FINANCIAL CORP,Mississippi; U.S.A,Pennsylvania; U.S.A,USD,USD,FALSE,93.4,99,75,97,99,96,99
++NVS,SNY,Healthcare,Drug Manufacturers - General,NOVARTIS AG,SANOFI,Switzerland,France,USD,USD,TRUE,93.4,100,86,72,98,98,98
++CFG,KEY,Financial Services,Banks - Regional,CITIZENS FINANCIAL GROUP INC,KEYCORP,Rhode Island; U.S.A,Ohio; U.S.A,USD,USD,FALSE,93.4,92,81,98,99,96,100
++FNB,HBAN,Financial Services,Banks - Regional,FNB CORP,HUNTINGTON BANCSHARES INC,Pennsylvania; U.S.A,Ohio; U.S.A,USD,USD,FALSE,93.3,99,73,98,99,97,99
++AMT,SBAC,Real Estate,REIT - Specialty,AMERICAN TOWER CORP,SBA COMMUNICATIONS CORP,Massachusetts; U.S.A,Florida; U.S.A,USD,USD,FALSE,93.3,73,100,92,99,99,99
++MTB,TCBI,Financial Services,Banks - Regional,M&T BANK CORP,TEXAS CAPITAL BANCSHARES INC,New York; U.S.A,Texas; U.S.A,USD,USD,FALSE,93.3,100,85,87,99,91,96
++DHR,QGEN,Healthcare,Diagnostics & Research,DANAHER CORP,QIAGEN NV,District Of Columbia; U.S.A,Netherlands,USD,USD,TRUE,93.3,81,94,95,98,98,96
++HAL,SLB,Energy,Oil & Gas Equipment & Services,HALLIBURTON CO,SCHLUMBERGER LIMITED,Texas; U.S.A,Texas; U.S.A,USD,USD,TRUE,93.2,87,98,68,99,99,98
++HBAN,PNC,Financial Services,Banks - Regional,HUNTINGTON BANCSHARES INC,PNC FINANCIAL SERVICES GROUP INC,Ohio; U.S.A,Pennsylvania; U.S.A,USD,USD,FALSE,93.2,87,89,89,99,97,99
++ETN,IR,Industrials,Specialty Industrial Machinery,EATON CORP PLC,INGERSOLL RAND INC,Ireland,North Carolina; U.S.A,USD,USD,TRUE,93.2,87,96,77,96,99,99
++CMI,ITT,Industrials,Specialty Industrial Machinery,CUMMINS INC,ITT INC,Indiana; U.S.A,New York; U.S.A,USD,USD,FALSE,93.1,90,99,75,98,94,94
++RF,TCBI,Financial Services,Banks - Regional,REGIONS FINANCIAL CORP,TEXAS CAPITAL BANCSHARES INC,Alabama; U.S.A,Texas; U.S.A,USD,USD,FALSE,93.1,91,90,85,98,95,98
++THO,WGO,Consumer Cyclical,Recreational Vehicles,THOR INDUSTRIES INC,WINNEBAGO INDUSTRIES INC,Indiana; U.S.A,Iowa; U.S.A,USD,USD,TRUE,93,95,79,96,98,96,98
++EPD,ET,Energy,Oil & Gas Midstream,ENTERPRISE PRODUCTS PARTNERS LP,ENERGY TRANSFER LP,Texas; U.S.A,Texas; U.S.A,USD,USD,TRUE,93,76,99,85,99,99,99
+diff --git a/statistical_arbitrage_alpha.Rproj b/statistical_arbitrage_alpha.Rproj
+index e83436a..edd9f3b 100644
+--- a/statistical_arbitrage_alpha.Rproj
++++ b/statistical_arbitrage_alpha.Rproj
+@@ -1,4 +1,5 @@
+ Version: 1.0
++ProjectId: 7a0a2c58-c029-40c7-8e33-6440ef921dfb
+ 
+ RestoreWorkspace: Default
+ SaveWorkspace: Default
+diff --git a/strategy_whole_numbers.R b/strategy_whole_numbers.R
+new file mode 100644
+index 0000000..4c4c346
+--- /dev/null
++++ b/strategy_whole_numbers.R
+@@ -0,0 +1,157 @@
++library(fastverse)
++library(finutils)
++library(ggplot2)
++library(PerformanceAnalytics)
++library(lubridate)
++
++
++# Import prices
++prices = qc_hour(
++  file_path = "F:/lean/data/stocks_hour.csv",
++  first_date = as.Date("2015-01-01"),
++  min_obs = 7*44,
++  duplicates = "fast",
++  add_dv_rank = FALSE
++)
++prices[, time := as.ITime(date)]
++
++# Keep hour 09:00, 15:00
++dt = prices[time %in% c(as.ITime("09:00:00"), as.ITime("15:00:00")),
++            .(symbol, date, open, close, volume, close_raw, time)]
++dt[time == as.ITime("09:00:00"), first_price := close]
++dt[time == as.ITime("15:00:00"), last_price := close]
++dt[, day := as.Date(date)]
++
++# Create signal
++back = dcast(dt[, .(symbol, date = as.Date(date), time, close, open, close_raw)],
++             symbol + date ~ time, value.var = list("close", "open", "close_raw"))
++back = back[, .(symbol, date, p1 = `close_09:00:00`, p2 = `open_15:00:00`, p1raw = `close_raw_15:00:00`)]
++
++# # Trading logic 1
++# back[, target_1 := shift(p1, 1, type = "lead") / p2 - 1, by = symbol]
++# back[, target_2 := shift(p2, 1, type = "lead") / p2 - 1, by = symbol]
++# back[, target_3 := shift(p2, 2, type = "lead") / p2 - 1, by = symbol]
++# back[, target_4 := shift(p2, 3, type = "lead") / p2 - 1, by = symbol]
++# back = na.omit(back)
++# levels = c(1)
++# back[, signal := fcase(
++#   (p1 / levels[1]) < 0.98 & (p2 / levels[1]) > 1.02, 1,
++#   # p1 < levels[2] & p2 > -levels[2], -1,
++#   # p1 < levels[3] & p2 > -levels[3], 1,
++#   # p1 < levels[4] & p2 > -levels[4], -1,
++#   # p1 < levels[5] & p2 > -levels[5], 1,
++#   default = 0
++# )]
++# back[signal == 1]
++# back[signal == 1, .(target_1 = mean(target_1),
++#                     target_2 = mean(target_2),
++#                     target_3 = mean(target_3),
++#                     target_4 = mean(target_4))]
++# portfolio = back[signal == 1]
++# portfolio[, weight := 0.02]
++# portfolio_xts = portfolio[, .(ret = sum(weight * target_1, na.rm = TRUE)), by = date]
++# setorder(portfolio_xts, date)
++# portfolio_xts = as.xts.data.table(portfolio_xts)
++# charts.PerformanceSummary(portfolio_xts)
++
++# Trading logic 2
++back[, week_year := ceiling_date(date, "week")]
++# back[, week_year := ceiling_date(date, "month")]
++backw = back[, .(
++  p1 = data.table::first(p1),
++  p2 = data.table::last(p2),
++  p1raw = data.table::first(p1raw)),
++  by = .(symbol, week_year)]
++backw[, target_1 := p2 / p1 - 1]
++backw[, target_1 := shift(target_1, 1, type = "lead"), by = symbol]
++backw = na.omit(backw)
++backw = backw[p1raw %between% c(0.05, 10)]
++levels = c(1)
++backw[, signal := fcase(
++  p1 < levels[1] & p2 > levels[1], 1,
++  # (p1 / levels[2]) < 0.99 & (p2 / levels[2]) > 1.01, 1,
++  # (p1 / levels[3]) < 0.99 & (p2 / levels[3]) > 1.01, 1,
++  default = 0
++)]
++backw[signal == 1]
++backw[signal == 1, .(target_1 = mean(target_1))]
++portfolio = backw[signal == 1]
++portfolio[, weight := 1 / length(p1), by = week_year]
++# portfolio[, weight := min(1 / length(p1), 0.03), by = week_year]
++# portfolio[, sum(weight), by = week_year][order(week_year)]
++portfolio_xts = portfolio[, .(ret = sum(weight * target_1, na.rm = TRUE)), by = week_year]
++setorder(portfolio_xts, week_year)
++portfolio_xts = as.xts.data.table(portfolio_xts)
++charts.PerformanceSummary(portfolio_xts)
++SharpeRatio.annualized(portfolio_xts, scale = 52, Rf = 0.0)
++Return.annualized(portfolio_xts, scale = 52)
++
++# Trading logic 3
++back[, week_year := ceiling_date(date, "week")]
++backw = back[, .(
++  p1 = data.table::first(p1),
++  p2 = data.table::last(p2),
++  p1raw = data.table::first(p1raw)),
++  by = .(symbol, week_year)]
++backw[, target_1 := p2 / p1 - 1]
++backw[, target_1 := shift(target_1, 1, type = "lead"), by = symbol]
++backw = na.omit(backw)
++levels = c(0.4)
++backw[, signal := fcase(
++  p1 < levels[1] & p2 > levels[1], 1,
++  default = NA
++)]
++backw[signal == 1]
++backw[, signal := nafill(signal, type = "locf"), by = symbol]
++backw[, signal := ifelse(signal == 1 & (p1 < 5 & p1 > 0.1), 1, NA)]
++backw[signal == 1, .(target_1 = mean(target_1))]
++portfolio = backw[signal == 1]
++portfolio[, weight := 1 / length(p1), by = week_year]
++portfolio_xts = portfolio[, .(ret = sum(weight * target_1, na.rm = TRUE)), by = week_year]
++setorder(portfolio_xts, week_year)
++portfolio_xts = as.xts.data.table(portfolio_xts)
++charts.PerformanceSummary(portfolio_xts)
++SharpeRatio.annualized(portfolio_xts, scale = 52, Rf = 0.0)
++Return.annualized(portfolio_xts, scale = 52)
++min(Drawdowns(portfolio_xts))
++
++# backtst function
++backtest = function(back, level) {
++  back[, signal := fcase(p1 < level & p2 > level, 1,default = NA)]
++  back[, signal := nafill(signal, type = "locf"), by = symbol]
++  portfolio = back[signal == 1]
++  portfolio[, weight := 1 / length(p1), by = week_year]
++  portfolio_xts = portfolio[, .(ret = sum(weight * target_1, na.rm = TRUE)), by = week_year]
++  setorder(portfolio_xts, week_year)
++  portfolio_xts = as.xts.data.table(portfolio_xts)
++  cbind.data.frame(
++    reta = Return.annualized(portfolio_xts, scale = 52)[1, 1],
++    sharpe = SharpeRatio.annualized(portfolio_xts, scale = 52, Rf = 0.0)[1, 1],
++    dd = min(Drawdowns(portfolio_xts))
++  )
++}
++grid = c(
++  seq(0.1, 10, by = 0.1),
++  10:100
++)
++res_l = lapply(grid, function(x) backtest(copy(backw), x))
++res = rbindlist(res_l)
++res[, grid := grid]
++head(res, 60)
++ggplot(res, aes(x = grid, y = reta)) +
++  geom_line() +
++  geom_point() +
++  labs(title = "Return vs Level", x = "Level", y = "Return") +
++  theme_minimal()
++ggplot(res, aes(x = grid, y = sharpe)) +
++  geom_line() +
++  geom_point() +
++  labs(title = "Return vs Level", x = "Level", y = "Return") +
++  theme_minimal()
++ggplot(res, aes(x = grid, y = dd)) +
++  geom_line() +
++  geom_point() +
++  labs(title = "Return vs Level", x = "Level", y = "Return") +
++  theme_minimal()
++
++
+
+4523e5e2a29516b917ea1bae7b684cdb75ef3e86 MislavSag Wed Dec 11 13:34:56 2024 +0100 secrets problem
+diff --git a/results.pci.R b/results.pci.R
+new file mode 100644
+index 0000000..e04469f
+--- /dev/null
++++ b/results.pci.R
+@@ -0,0 +1,1147 @@
++library(data.table)
++library(lubridate)
++library(ggplot2)
++library(patchwork)
++library(PerformanceAnalytics)
++library(future.apply)
++library(partialCI)
++library(xts)
++library(AzureStor)
++
++options(future.globals.maxSize = 4000 * 1024^2) # 2GB
++
++
++# DATA --------------------------------------------------------------------
++# Daily prives
++prices = fread("F:/strategies/statsarb/pci/prices.csv")
++
++# Reshape prices to make below function faster
++prices = as.xts.data.table(dcast(prices, date ~ symbol, value.var = "close"))
++
++# Import pci tests
++files = list.files("F:/strategies/statsarb/pci/output_pci", full.names = TRUE)
++pci_tests = lapply(files, fread)
++pci_tests = rbindlist(pci_tests, fill = TRUE)
++
++# Check for missing values
++pci_tests[, .(pvmr_miss = sum(is.na(pvmr)),
++              rho_miss = sum(is.na(rho)),
++              p_rw_miss = sum(is.na(p_rw)),
++              p_ar_miss = sum(is.na(p_ar)),
++              negloglik_miss = sum(is.na(negloglik)))]
++pci_tests = na.omit(pci_tests, cols = c("pvmr", "rho", "p_rw", "p_ar", "negloglik"))
++
++# Check one meta row
++pci_test[search_type == "lasso" & maxfact == 1 & train_size == 24]
++pci_test[search_type == "lasso" & maxfact == 1 & train_size == 24] |>
++  _[pvmr > 0.5  & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05 &
++      negloglik <= quantile(negloglik, probs = 0.25)]
++
++
++# FILTER PAIRS ------------------------------------------------------------
++# Apply restrictions to the universe
++# 1) pairs with a half-life of mean-reversion of one day or less - thereby avoiding to select
++#where trading gains are largely attributable to bid-ask bounce
++# 2) pvmr > 0.5 ensures    pairs  more reliable parameter estimates
++# 3) p_rw < 0.05 & p_ar < 0.05. A time series is classified as partially cointegrated,
++#    if and only if the random walk as well as the AR(1)-hypotheses are rejected
++# 3) my condition: MR p value should be lower than 0.05 because this test confirms mean reverting component
++# 4) restriction to same sector I DON'T WANT APPLY THIS FOR  NOW
++# 5) 25% lowest  by neLog
++# 6) possible to add additional fundamental matching
++pci_tests_eligible = pci_tests[pvmr > 0.5  & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05]
++pci_tests_eligible[, nq := quantile(negloglik, probs = 0.25),
++                   by = .(search_type, maxfact, train_size, train_start)]
++pci_tests_eligible = pci_tests_eligible[negloglik <= nq]
++
++# TODO: Later try with maxfact 2
++pci_tests_eligible = pci_tests_eligible[maxfact == 1]
++
++# remove same pairs
++pci_tests_eligible = pci_tests_eligible[
++  , .SD[!(series_2 %in% series_1)],
++  by = .(search_type, maxfact, train_size, train_start)]
++
++
++# PAIRS STRATEGY FUNCTION -------------------------------------------------
++# Function to generate zscore
++generate_signal_zscore = function(Z_score, threshold_long, threshold_short) {
++  signal = Z_score
++  colnames(signal) = "signal"
++  signal[] = NA
++
++  # initial position
++  signal[1] = 0
++  if (Z_score[1] <= threshold_long[1]) {
++    signal[1] = 1
++  } else if (Z_score[1] >= threshold_short[1])
++    signal[1] = -1
++
++  # loop
++  for (t in 2:nrow(Z_score)) {
++    if (signal[t-1] == 0) {  # if we were in no position
++      if (Z_score[t] <= threshold_long[t]) {
++        signal[t] = 1
++      } else if(Z_score[t] >= threshold_short[t]) {
++        signal[t] = -1
++      } else signal[t] = 0
++    } else if (signal[t-1] == 1) {  #if we were in a long position
++      if (Z_score[t] >= 0) signal[t] = 0
++      else signal[t] = signal[t-1]
++    } else {  #if we were in a short position
++      if (Z_score[t] <= 0) signal[t] = 0
++      else signal[t] = signal[t-1]
++    }
++  }
++  return(signal)
++}
++
++# main function to analyse pairs
++pairs_trading_pci = function(train_start, train_end,
++                             test_start = train_end + 1,
++                             test_end = ceiling_date(test_start, unit = "month")-1,
++                             ticker_1, ticker_2, ...,
++                             std_entry = 1,
++                             plot_pnl = TRUE) {
++  # Debug
++  # n_ = 9
++  # pci_tests_eligible[n_]
++  # ticker_1 = pci_tests_eligible[n_, series_1]
++  # ticker_2 = pci_tests_eligible[n_, series_2]
++  # train_start = pci_tests_eligible[n_, train_start]
++  # train_end = pci_tests_eligible[n_, train_end]
++  # test_start = pci_tests_eligible[n_, train_end + 1]
++  # test_end = pci_tests_eligible[n_, ceiling_date(test_start, unit = "month")-1]
++
++  # Define train and test sets
++  y1_train = prices[paste0(train_start, "/", train_end), ticker_1]
++  y2_train = prices[paste0(train_start, "/", train_end), ticker_2]
++  y1_test = prices[paste0(test_start, "/", test_end), ticker_1]
++  y2_test = prices[paste0(test_start, "/", test_end), ticker_2]
++
++  # get spreads
++  fit_pci = fit.pci(y1_train, y2_train)
++  hs_train = statehistory.pci(fit_pci)
++  hs_test = statehistory.pci(fit_pci, data = y1_test, basis = y2_test)
++  hs = rbind(hs_train, hs_test)
++  spread_train = xts(hs_train[, 4], as.Date(rownames(hs_train)))
++  spread = xts(hs[, 4], as.Date(rownames(hs)))
++
++  # z-score
++  spread_var = sd(spread_train)
++  Z_score_M = spread/spread_var
++
++  # generate signals with z scored
++  threshold_long = threshold_short = Z_score_M
++  threshold_short[] = std_entry
++  threshold_long[] = -std_entry
++
++  # get and plot signals
++  signal = generate_signal_zscore(Z_score_M, threshold_long, threshold_short)
++
++  # let's compute the PnL directly from the signal and spread
++  spread_return = diff(Z_score_M)
++  traded_return = spread_return * lag(signal)   # NOTE THE LAG!!
++  traded_return[is.na(traded_return)] = 0
++  colnames(traded_return) = "traded spread"
++
++  # plot PnL
++  if (plot_pnl) {
++    # plot Pnl
++    data_plot = as.data.table(traded_return)
++    setnames(data_plot, c("date", "spread"))
++    g1 = ggplot(as.data.table(Z_score_M), aes(x = index, y = V1)) + geom_line() +
++      geom_hline(yintercept = 0, color = "red") +
++      geom_hline(yintercept = 1, color = "blue") +
++      geom_hline(yintercept = -1, color = "blue") +
++      geom_vline(xintercept = test_start, color = "blue")
++    g2 = ggplot(data_plot, aes(date, y = 1 + cumsum(spread))) +
++      geom_line() +
++      geom_vline(xintercept = test_start, color = "blue")
++    print(g1 / g2)
++  }
++
++  # data for QC
++  qc_data = cbind(date = rownames(hs_test), as.data.table(hs_test))
++  qc_data[, Z_score_M := M / spread_var]
++  qc_data[, symbol_1 := ticker_1]
++  qc_data[, symbol_2 := ticker_2]
++  qc_data[, beta := fit_pci$beta]
++  cols = colnames(qc_data)[2:ncol(qc_data)]
++  qc_data[, (cols) := lapply(.SD, shift), .SDcols = cols]
++  qc_data = na.omit(qc_data)
++
++  return(qc_data)
++}
++
++# example
++n_ = sample(seq_along(files), 1)
++pairs_trading_pci(
++  train_start = pci_tests_eligible[n_, train_start],
++  train_end = pci_tests_eligible[n_, train_end],
++  # test_end = ceiling_date(test_start, unit = "month")-1
++  test_end = pci_tests_eligible[n_, train_end] + 125,
++  ticker_1 = pci_tests_eligible[n_, series_1],
++  ticker_2 = pci_tests_eligible[n_, series_2],
++  std_entry = 1,
++  plot_pnl = TRUE
++)
++
++
++# PAIRS TRADING FUNCION SIMPLE --------------------------------------------
++# main function to analyse pairs
++pairs_trading_pci_performance = function(train_start,
++                                         train_end,
++                                         test_start = train_end + 1,
++                                         test_end = ceiling_date(test_start, unit = "month") -1,
++                                         ticker_1, ticker_2,
++                                         std_entry = 1,
++                                         set = c("test", "train", "both")) {
++  # Debug
++  # n_ = 1
++  # pci_tests_eligible[n_]
++  # ticker_1 = pci_tests_eligible[n_, series_1]
++  # ticker_2 = pci_tests_eligible[n_, series_2]
++  # train_start = pci_tests_eligible[n_, train_start]
++  # train_end = pci_tests_eligible[n_, train_end]
++  # test_start = pci_tests_eligible[n_, train_end + 1]
++  # test_end = pci_tests_eligible[n_, ceiling_date(test_start, unit = "month")-1]
++
++  # Arguments
++  set = match.arg(set)
++
++  # Define train and test sets
++  y1_train = prices[paste0(train_start, "/", train_end), ticker_1]
++  y2_train = prices[paste0(train_start, "/", train_end), ticker_2]
++  y1_test = prices[paste0(test_start, "/", test_end), ticker_1]
++  y2_test = prices[paste0(test_start, "/", test_end), ticker_2]
++
++  # get spreads
++  fit_pci = fit.pci(y1_train, y2_train)
++  hs_train = statehistory.pci(fit_pci)
++  hs_test = statehistory.pci(fit_pci, data = y1_test, basis = y2_test)
++  hs = rbind(hs_train, hs_test)
++  spread_train = xts(hs_train[, 4], as.Date(rownames(hs_train)))
++  spread = xts(hs[, 4], as.Date(rownames(hs)))
++
++  # z-score
++  spread_var = sd(spread_train)
++  if (spread_var == 0) {
++    print("Spread variance is zero")
++    return(NULL)
++  }
++  Z_score_M = spread/spread_var
++
++  # generate signals with z scored
++  threshold_long = threshold_short = Z_score_M
++  threshold_short[] = std_entry
++  threshold_long[] = -std_entry
++
++  # get and plot signals
++  signal = tryCatch(
++    generate_signal_zscore(Z_score_M, threshold_long, threshold_short),
++    error = function(e) NULL)
++  if (is.null(signal)) {
++    print("Error in signal generation")
++    return(NULL)
++  }
++
++  # let's compute the PnL directly from the signal and spread
++  spread_return = diff(Z_score_M)
++  traded_return = spread_return * lag(signal)   # NOTE THE LAG!!
++  traded_return[is.na(traded_return)] = 0
++  colnames(traded_return) = paste0(ticker_1, "_", ticker_2)
++
++  # Keep only test or train
++  if (set == "test") {
++    traded_return = traded_return[paste0(test_start, "/", test_end)]
++  } else if (set == "train") {
++    traded_return = traded_return[paste0(train_start, "/", train_end)]
++  }
++
++  return(traded_return)
++}
++
++# example
++n_ = sample(seq_along(files), 1)
++pairs_trading_pci_performance(
++  train_start = pci_tests_eligible[n_, train_start],
++  train_end = pci_tests_eligible[n_, train_end],
++  ticker_1 = pci_tests_eligible[n_, series_1],
++  ticker_2 = pci_tests_eligible[n_, series_2],
++  std_entry = 1
++)
++
++# Define all parameters
++params = expand.grid(
++  train_start = meta,
++  train_end = pci_tests_eligible[, train_end],
++  ticker_1 = pci_tests_eligible[, series_1],
++  ticker_2 = pci_tests_eligible[, series_2],
++  std_entry = 1
++)
++
++# Generate for all pairs for all meta rows
++plan(multisession, workers = 8L)
++params = CJ(search_type = pci_tests[, unique(search_type)],
++            maxfact = pci_tests[, unique(maxfact)],
++            train_size = pci_tests[, unique(train_size)])
++pnl_by_i_l = list()
++for (i in 1:nrow(params)) {
++  # Extract params
++  p = params[i, ]
++  # print(p)
++
++  # sample pci pairs
++  pci_tests_eligible_sample = pci_tests_eligible[
++    search_type == p$search_type &
++      maxfact == p$maxfact &
++      train_size == p$train_size
++  ]
++
++  # Return portfolio return
++  s = Sys.time()
++  pnl_by_i = future_lapply(1:nrow(pci_tests_eligible_sample), function(j) {
++    print(j)
++    pairs_trading_pci_performance(
++      train_start = pci_tests_eligible[j, train_start],
++      train_end = pci_tests_eligible[j, train_end],
++      ticker_1 = pci_tests_eligible[j, series_1],
++      ticker_2 = pci_tests_eligible[j, series_2],
++      std_entry = 1
++    )
++  })
++  e = Sys.time()
++  e - s
++
++  # save
++  test = do.call(merge, c(pnl_by_i[1:500], fill = NA))
++  names(test)
++
++  # Merge across date and symbol
++  pnl_dt = lapply(pnl_by_i, function(x) {
++    if (is.null(x)) return(NULL)
++    dt = data.table(date = index(x), value = coredata(x)[,1])
++    dt[, symbol := colnames(x)[1]]
++    return(dt)
++  })
++  pnl_dt = rbindlist(pnl_dt)
++  pnl_dt = dcast(pnl_dt, date ~ symbol, value.var = "value")
++  setorder(pnl_dt, date)
++  dim(pnl_dt)
++  pnl_dt[, 1:5]
++
++  # Calculate portfolio returns
++  charts.PerformanceSummary(Return.portfolio(pnl_dt)[100:150])
++}
++
++pnl_by_i = do.call(cbind, pnl_by_i)
++
++Return.portfolio(pnl_by_i)
++charts.PerformanceSummary(Return.portfolio(pnl_by_i))
++
++
++# DATA FOR QC -------------------------------------------------------------
++# Choose best parameters
++param_search_type_qc = "lasso"
++param_maxfact_qc = 1
++param_train_size_qc = 24
++
++# Function to extract data for QC
++pairs_trading_pci_qc = function(train_start,
++                                train_end,
++                                test_start = train_end + 1,
++                                test_end = ceiling_date(test_start, unit = "month") - 1,
++                                ticker_1,
++                                ticker_2,
++                                std_entry = 1) {
++  # Debug
++  # n_ = 13
++  # pci_tests_eligible[n_]
++  # ticker_1 = pci_eligible_qc[n_, series_1]
++  # ticker_2 = pci_eligible_qc[n_, series_2]
++  # train_start = pci_eligible_qc[n_, train_start]
++  # train_end = pci_eligible_qc[n_, train_end]
++  # test_start = pci_eligible_qc[n_, train_end + 1]
++  # test_end = pci_eligible_qc[n_, ceiling_date(test_start, unit = "month")-1]
++
++  # Define train and test sets
++  y1_train = prices[paste0(train_start, "/", train_end), ticker_1]
++  y2_train = prices[paste0(train_start, "/", train_end), ticker_2]
++  y1_test = prices[paste0(test_start, "/", test_end), ticker_1]
++  y2_test = prices[paste0(test_start, "/", test_end), ticker_2]
++
++  # get spreads
++  fit_pci = fit.pci(y1_train, y2_train)
++  hs_train = statehistory.pci(fit_pci)
++  hs_test = statehistory.pci(fit_pci, data = y1_test, basis = y2_test)
++  hs = rbind(hs_train, hs_test)
++  spread_train = xts(hs_train[, 4], as.Date(rownames(hs_train)))
++  spread = xts(hs[, 4], as.Date(rownames(hs)))
++
++  # Calculate sd of train spread to get z-score below
++  spread_var = sd(spread_train)
++  if (spread_var == 0) {
++    print("Spread variance is zero")
++    return(NULL)
++  }
++
++  # data for QC
++  qc_data = cbind(date = rownames(hs_test), as.data.table(hs_test))
++  qc_data[, Z_score_M := M / spread_var]
++  qc_data[, symbol_1 := ticker_1]
++  qc_data[, symbol_2 := ticker_2]
++  qc_data[, beta := fit_pci$beta]
++  qc_data = na.omit(qc_data)
++
++  return(qc_data)
++}
++
++# Get dat for QC
++pci_eligible_qc = pci_tests_eligible[
++  search_type == param_search_type_qc &
++    maxfact == param_maxfact_qc &
++    train_size == param_train_size_qc
++]
++setorder(pci_eligible_qc, train_start)
++
++# Example
++n_ = sample(seq_along(pci_eligible_qc), 1)
++pairs_trading_pci_qc(
++  train_start = pci_eligible_qc[n_, train_start],
++  train_end = pci_eligible_qc[n_, train_end],
++  ticker_1 = pci_eligible_qc[n_, series_1],
++  ticker_2 = pci_eligible_qc[n_, series_2],
++  std_entry = 1,
++)[]
++
++# Get all data for QC
++plan(multisession, workers = 8L)
++# qc_data = lapply(1:nrow(pci_eligible_qc), function(j) {
++qc_data = future_lapply(1:nrow(pci_eligible_qc), function(j) {
++  pairs_trading_pci_qc(
++    train_start = pci_eligible_qc[j, train_start],
++    train_end = pci_eligible_qc[j, train_end],
++    ticker_1 = pci_eligible_qc[j, series_1],
++    ticker_2 = pci_eligible_qc[j, series_2],
++    std_entry = 1
++  )
++})
++qc_data = rbindlist(qc_data)
++setorder(qc_data, date, symbol_1)
++
++# Save locally and to Azure blob
++fwrite(qc_data, "F:/strategies/statsarb/pci/qc_data.csv")
++bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++                               Sys.getenv("BLOB-KEY"))
++cont = storage_container(bl_endp_key, "qc-backtest")
++sample_ = qc_data[date > as.Date("2020-01-01")]
++sample_[, date := paste0(date, " 15:59:00")]
++storage_write_csv(sample_, cont, "pci.csv", col_names = FALSE)
++
++# # save data to QC
++# bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++#                                Sys.getenv("BLOB-KEY"))
++# cont <- storage_container(bl_endp_key, "qc-backtest")
++# time_ <- format.POSIXct(Sys.time(), format = "%Y%m%d%H%M%S")
++# lapply(unique(pairs_results$symbol_1), function(s) {
++#   sample_ <- pairs_results[symbol_1 == s]
++#   sample_[, date := paste0(date, " 15:59:00")]
++#   file_name <- paste0("pairs_pci_", s, "_", sample_[1, symbol_2], "_", time_, ".csv")
++#   print(file_name)
++#   print(sample_)
++#   storage_write_csv(sample_, cont, file_name, col_names = FALSE)
++# })
++
++
++# WARNING: QC DATA is not shifted as before in function
++cols = colnames(qc_data)[2:ncol(qc_data)]
++qc_data[, (cols) := lapply(.SD, shift), .SDcols = cols]
++
++
++
++
++
++
++
++
++# # example of partially cointegrated pairs
++# pairs = unlist(pci_tests_eligible[1, 1:2])
++# plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of first pair
++# # EQIX - Equinix, Inc. je američka multinacionalna tvrtka sa sjedištem u Redwood Cityju, Kalifornija,
++# #        specijalizirana za internetske veze i podatkovne centre.
++# # AMT - American Tower Corporation je američka zaklada za ulaganje u nekretnine te vlasnik i operater bežične i
++# #       televizijske komunikacijske infrastrukture u nekoliko zemalja
++# pairs <- unlist(pci_tests_eligible[2, 1:2])
++# plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of second pair
++# # DOV - američki je konglomerat proizvođača industrijskih proizvod
++# # APH - glavni proizvođač elektroničkih i optičkih konektora, kabelskih i interkonektnih sustava kao što su koaksijalni kabeli
++# pairs = unlist(pci_tests_eligible[3, 1:2])
++# plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of third pair
++# # O - investicijski fond za nekretnine
++# # CPT - investicijski fond za nekretnine
++#
++#
++# # TRADING STRATEGY FOR ONE PAIR ----------------------------------------------------
++# # preparedata for pci estimation
++# n_ = 1 # GOOD: 1,3,4,6,7,10  FLAT: 2,8,9  BAD: 5
++# cat("symbols are", unlist(pci_tests_eligible[n_, 1]), " and ",
++#     unlist(pci_tests_eligible[n_, 2]))
++# y1_train = train[, unlist(pci_tests_eligible[n_, 1])]
++# y2_train = train[, unlist(pci_tests_eligible[n_, 2])]
++# y1_test = test[, unlist(pci_tests_eligible[n_, 1])]
++# y2_test = test[, unlist(pci_tests_eligible[n_, 2])]
++# y1 = X["2019-01-01/2022-01-01", unlist(pci_tests_eligible[n_, 1])]
++# y2 = X["2019-01-01/2022-01-01", unlist(pci_tests_eligible[n_, 2])]
++#
++# # get spreads
++# fit_pci = fit.pci(y1_train, y2_train)
++# plot(fit_pci)
++# hs_train = statehistory.pci(fit_pci)
++# hs_test  = statehistory.pci(fit_pci, data = y1_test, basis = y2_test)
++# hs = rbind(hs_train, hs_test)
++# spread_train = xts(hs_train[, 4], as.Date(rownames(hs_train)))
++# spread = xts(hs[, 4], as.Date(rownames(hs)))
++# ggplot(as.data.table(spread), aes(x = index, y = V1)) +
++#   geom_line() +
++#   geom_vline(xintercept = as.Date("2021-01-01"), color = "blue")
++#
++# # understand calculation
++# cat("Price data ", head(hs_test$Y))
++# cat("Price X1 ", head(y1_test)) # AEE
++# cat("Price X0 ", head(y2_test)) # XEL
++# cat("Beta ", fit_pci$beta)
++# cat("Y hat calculation", head(y2_train %*% fit_pci$beta))
++# print("Hidden states:")
++# head(hs_train)
++#
++# # calculate std of spread an plot it
++# spread_var = sd(spread_train)
++# ggplot(as.data.table(spread), aes(x = index)) +
++#   geom_line(aes(y = V1)) +
++#   geom_hline(aes(yintercept = spread_var), color = "red") +
++#   geom_hline(aes(yintercept = -spread_var), color = "red") +
++#   geom_hline(aes(yintercept = spread_var*2), color = "green") +
++#   geom_hline(aes(yintercept = -spread_var*2), color = "green") +
++#   geom_vline(xintercept = as.Date("2017-01-01"), color = "blue")
++#
++# # plot spread and thresholdswith z-score
++# Z_score_M = spread/sd(spread_train)
++# plot(Z_score_M)
++# ggplot(as.data.table(Z_score_M), aes(x = index, y = V1)) + geom_line() +
++#   geom_hline(yintercept = 0, color = "red") +
++#   geom_hline(yintercept = 1, color = "blue") +
++#   geom_hline(yintercept = -1, color = "blue") +
++#   geom_vline(xintercept = as.Date("2017-01-01"), color = "blue")
++#
++# # trading signal
++# threshold = spread_var # in the paper authors uses theta = 1 (probbably -1 also) as the entry threshold
++# threshold_long = threshold_short = spread
++# threshold_short[] = spread_var
++# threshold_long[] = -spread_var
++# # Z_score_M <- spread
++# generate_signal = function(Z_score_M, threshold_long, threshold_short) {
++#   signal = Z_score_M
++#   colnames(signal) = "signal"
++#   signal[] = NA
++#
++#   # initial position
++#   signal[1] = 0
++#   if (Z_score_M[1] <= threshold_long[1]) {
++#     signal[1] = 1
++#   } else if (Z_score_M[1] >= threshold_short[1])
++#     signal[1] = -1
++#
++#   # loop
++#   for (t in 2:nrow(Z_score_M)) {
++#     if (signal[t-1] == 0) {  # if we were in no position
++#       if (Z_score_M[t] <= threshold_long[t]) {
++#         signal[t] <- 1
++#       } else if(Z_score_M[t] >= threshold_short[t]) {
++#         signal[t] <- -1
++#       } else signal[t] <- 0
++#     } else if (signal[t-1] == 1) {  # if we were in a long position
++#       if (Z_score_M[t] >= (0.5 * spread_var)) signal[t] <- 0
++#       else signal[t] <- signal[t-1]
++#     } else {  # if we were in a short position
++#       if (Z_score_M[t] <= -(0.5 * spread_var)) signal[t] <- 0
++#       else signal[t] <- signal[t-1]
++#     }
++#   }
++#   return(signal)
++# }
++#
++# # get and plot signals
++# signal = generate_signal(spread, threshold_long, threshold_short)
++# ggplot(as.data.table(cbind(spread, signal)), aes(x = index)) +
++#   geom_line(aes(y = spread)) +
++#   geom_line(aes(y = signal), color = "red")
++#
++# # generate signals with z scored
++# threshold_long = threshold_short <- Z_score_M
++# threshold_short[] = 1
++# threshold_long[] = -1
++# generate_signal_zscore <- function(Z_score, threshold_long, threshold_short) {
++#   signal <- Z_score
++#   colnames(signal) <- "signal"
++#   signal[] <- NA
++#
++#   #initial position
++#   signal[1] <- 0
++#   if (Z_score[1] <= threshold_long[1]) {
++#     signal[1] <- 1
++#   } else if (Z_score[1] >= threshold_short[1])
++#     signal[1] <- -1
++#
++#   # loop
++#   for (t in 2:nrow(Z_score)) {
++#     if (signal[t-1] == 0) {  #if we were in no position
++#       if (Z_score[t] <= threshold_long[t]) {
++#         signal[t] <- 1
++#       } else if(Z_score[t] >= threshold_short[t]) {
++#         signal[t] <- -1
++#       } else signal[t] <- 0
++#     } else if (signal[t-1] == 1) {  #if we were in a long position
++#       if (Z_score[t] >= 0) signal[t] <- 0
++#       else signal[t] <- signal[t-1]
++#     } else {  #if we were in a short position
++#       if (Z_score[t] <= 0) signal[t] <- 0
++#       else signal[t] <- signal[t-1]
++#     }
++#   }
++#   return(signal)
++# }
++#
++# # get and plot signals
++# signal <- generate_signal(Z_score_M, threshold_long, threshold_short)
++# ggplot(as.data.table(cbind(Z_score_M, signal)), aes(x = index)) +
++#   geom_line(aes(y = Z_score_M)) +
++#   geom_line(aes(y = signal), color = "red") +
++#   geom_vline(xintercept = as.Date("2021-01-01"), color = "blue")
++#
++#
++# # let's compute the PnL directly from the signal and spread
++# spread_return <- diff(Z_score_M)
++# traded_return <- spread_return * lag(signal)   # NOTE THE LAG!!
++# traded_return[is.na(traded_return)] <- 0
++# colnames(traded_return) <- "traded spread"
++#
++# # plot Pnl
++# data_plot <- as.data.table(traded_return)
++# setnames(data_plot, c("date", "spread"))
++# ggplot(data_plot, aes(date, y = 1 + cumsum(spread))) +
++#   geom_line() +
++#   geom_vline(xintercept = as.Date("2021-01-01"), color = "blue")
++#
++#
++# # PAIRS STRATEGY FUNCTION -------------------------------------------------
++# # main function to analyse pairs
++# pairs_trading_pci <- function(y1_train, y2_train, y1_test, y2_test,
++#                               std_entry = 1, plot_pnl = TRUE) {
++#
++#   # symbols
++#   symb1 <- colnames(y1_train)
++#   symb2 <- colnames(y2_train)
++#
++#   # get spreads
++#   fit_pci <- fit.pci(y1_train, y2_train)
++#   hs_train <- statehistory.pci(fit_pci)
++#   hs_test <- statehistory.pci(fit_pci, data = y1_test, basis = y2_test)
++#   hs <- rbind(hs_train, hs_test)
++#   spread_train <- xts(hs_train[, 4], as.Date(rownames(hs_train)))
++#   spread <- xts(hs[, 4], as.Date(rownames(hs)))
++#
++#   # z-score
++#   spread_var <- sd(spread_train)
++#   Z_score_M <- spread/spread_var
++#
++#   # generate signals with z scored
++#   threshold_long <- threshold_short <- Z_score_M
++#   threshold_short[] <- std_entry
++#   threshold_long[] <- -std_entry
++#   generate_signal_zscore <- function(Z_score, threshold_long, threshold_short) {
++#     signal <- Z_score
++#     colnames(signal) <- "signal"
++#     signal[] <- NA
++#
++#     #initial position
++#     signal[1] <- 0
++#     if (Z_score[1] <= threshold_long[1]) {
++#       signal[1] <- 1
++#     } else if (Z_score[1] >= threshold_short[1])
++#       signal[1] <- -1
++#
++#     # loop
++#     for (t in 2:nrow(Z_score)) {
++#       if (signal[t-1] == 0) {  #if we were in no position
++#         if (Z_score[t] <= threshold_long[t]) {
++#           signal[t] <- 1
++#         } else if(Z_score[t] >= threshold_short[t]) {
++#           signal[t] <- -1
++#         } else signal[t] <- 0
++#       } else if (signal[t-1] == 1) {  #if we were in a long position
++#         if (Z_score[t] >= 0) signal[t] <- 0
++#         else signal[t] <- signal[t-1]
++#       } else {  #if we were in a short position
++#         if (Z_score[t] <= 0) signal[t] <- 0
++#         else signal[t] <- signal[t-1]
++#       }
++#     }
++#     return(signal)
++#   }
++#
++#
++#   # get and plot signals
++#   signal <- generate_signal_zscore(Z_score_M, threshold_long, threshold_short)
++#
++#   # let's compute the PnL directly from the signal and spread
++#   spread_return <- diff(Z_score_M)
++#   traded_return <- spread_return * lag(signal)   # NOTE THE LAG!!
++#   traded_return[is.na(traded_return)] <- 0
++#   colnames(traded_return) <- "traded spread"
++#
++#   # plot PnL
++#   if (plot_pnl) {
++#     # plot Pnl
++#     data_plot <- as.data.table(traded_return)
++#     setnames(data_plot, c("date", "spread"))
++#     g1 <- ggplot(as.data.table(Z_score_M), aes(x = index, y = V1)) + geom_line() +
++#       geom_hline(yintercept = 0, color = "red") +
++#       geom_hline(yintercept = 1, color = "blue") +
++#       geom_hline(yintercept = -1, color = "blue") +
++#       geom_vline(xintercept = as.Date("2017-01-01"), color = "blue")
++#     g2 <- ggplot(data_plot, aes(date, y = 1 + cumsum(spread))) +
++#       geom_line() +
++#       geom_vline(xintercept = as.Date("2021-01-01"), color = "blue")
++#     print(g1 / g2)
++#   }
++#
++#   # data for QC
++#   qc_data <- cbind(date = rownames(hs_test), as.data.table(hs_test))
++#   qc_data[, Z_score_M := M / spread_var]
++#   qc_data[, symbol_1 := symb1]
++#   qc_data[, symbol_2 := symb2]
++#   qc_data[, beta := fit_pci$beta]
++#   cols <- colnames(qc_data)[2:ncol(qc_data)]
++#   qc_data[, (cols) := lapply(.SD, shift), .SDcols = cols]
++#   qc_data <- na.omit(qc_data)
++#
++#   return(qc_data)
++# }
++#
++# # example
++# n_ = 6
++# pairs_trading_pci(
++#   y1_train = train[, unlist(pci_tests_eligible[n_, 1])],
++#   y2_train = train[, unlist(pci_tests_eligible[n_, 2])],
++#   y1_test = test[, unlist(pci_tests_eligible[n_, 1])],
++#   y2_test = test[, unlist(pci_tests_eligible[n_, 2])],
++#   std_entry = 1,
++#   plot_pnl = TRUE
++# )
++#
++# # all pairs
++# pairs_results_l <- lapply(1:nrow(pci_tests_eligible), function(n_) {
++#   pairs_trading_pci(
++#     y1_train = train[, unlist(pci_tests_eligible[n_, 1])],
++#     y2_train = train[, unlist(pci_tests_eligible[n_, 2])],
++#     y1_test = test[, unlist(pci_tests_eligible[n_, 1])],
++#     y2_test = test[, unlist(pci_tests_eligible[n_, 2])],
++#     std_entry = 1,
++#     plot_pnl = FALSE
++#   )
++# })
++# pairs_results <- rbindlist(pairs_results_l)
++#
++#
++#
++# # SAVE FOR QC BACKTEST ----------------------------------------------------
++# # save data to QC
++# bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"),
++#                                Sys.getenv("BLOB-KEY"))
++# cont <- storage_container(bl_endp_key, "qc-backtest")
++# time_ <- format.POSIXct(Sys.time(), format = "%Y%m%d%H%M%S")
++# lapply(unique(pairs_results$symbol_1), function(s) {
++#   sample_ <- pairs_results[symbol_1 == s]
++#   sample_[, date := paste0(date, " 15:59:00")]
++#   file_name <- paste0("pairs_pci_", s, "_", sample_[1, symbol_2], "_", time_, ".csv")
++#   print(file_name)
++#   print(sample_)
++#   storage_write_csv(sample_, cont, file_name, col_names = FALSE)
++# })
++#
++# # # simulate quantities and prices
++# # A = 10000
++# # aee = 4.2
++# # xel = 3.8
++# # share = 0.2
++# # A_ = 2000
++# # q_xel = floor(A_ / xel)
++# # q_aee = q_xel * fit_pci$beta
++# #
++# # q_xel * xel
++# # q_aee * aee
++# #
++# # q_aee = A_ / (aee %*% fit_pci$beta)
++# # q_xel * fit_pci$beta
++# #
++# # (xel / aee) * fit_pci$beta
++# #
++# #
++# # 61.657137504 * 323
++# # 69.145082055 * 312
++#
++#
++#
++#
++# # PAPER TRADING ----------------------------------------------------------
++# # sp500 universe
++# fmp = FMP$new()
++# symbols <- fmp$get_sp500_symbols()
++#
++# # get daily market data for sp500 stocks
++# start_date_test <- as.Date(format.Date(Sys.Date(), format = "%Y-%m-01")) - 30
++# start_date <- start_date_test  - (365 * 3)
++# arr <- tiledb_array("D:/equity-usa-daily-fmp",
++#                     as.data.frame = TRUE,
++#                     query_layout = "UNORDERED",
++#                     selected_ranges = list(symbol = cbind(symbols, symbols))
++#                     # selected_ranges = list(date = cbind(start_date, Sys.Date()),
++#                     # symbol = cbind(symbols, symbols))
++# )
++# system.time(prices_new <- arr[])
++# tiledb_array_close(arr)
++# prices_dt_new <- as.data.table(prices_new)
++# setorder(prices_dt_new, symbol, date)
++#
++# # cleaning steps with explanations
++# prices_dt_new <- prices_dt_new[isBusinessDay(date)] # keep only trading days
++# prices_dt_new <- prices_dt_new[open > 0 & high > 0 & low > 0 & close > 0 & adjClose > 0] # remove rows with prices <= 0
++# prices_dt_new <- prices_dt_new[, .(symbol, date, adjClose )] # keep only columns we need
++# prices_dt_new <- unique(prices_dt_new, by = c("symbol", "date")) # remove duplicates
++# prices_dt_new <- na.omit(prices_dt_new) # remove missing values
++# setorder(prices_dt_new, "symbol", "date") # order for returns calculation
++# prices_dt_new[, returns := adjClose / data.table::shift(adjClose, 1, type = "lag") - 1, by = symbol]
++# prices_dt_new <- prices_dt_new[returns < 1] # TODO:: better outlier detection mechanism
++# prices_dt_new <- dcast(prices_dt_new, date ~ symbol, value.var = "adjClose")
++#
++# # remove columns with NA values
++# keep_cols <- names(which(colMeans(!is.na(prices_dt_new)) > 0.99))
++# prices_dt_new <- prices_dt_new[, .SD, .SDcols = keep_cols]
++# X <- as.xts.data.table(prices_dt_new)
++# X <- X[, colSums(!is.na(X)) == max(colSums(!is.na(X)))]
++# X <- log(X)
++# dim(X)
++#
++# # split in train and test set
++# train_dates <- paste(start_date, start_date_test, sep = "/")
++# train <- X[train_dates]
++# test_dates <- paste(start_date_test, Sys.Date(), sep = "/")
++# test <- X[test_dates]
++#
++# # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
++# pci_tests_new_i <- list()
++# for (i in 1:ncol(train)) {
++#
++#   # DEBUG
++#   print(i)
++#
++#   # quasi multivariate pairs
++#   hedge <- tryCatch(hedge.pci(train[, i], train[, -i], maxfact = 1, use.multicore = FALSE),
++#                     error = function(e) NULL)
++#   if (is.null(hedge)) {
++#     pci_tests_i[[i]] <- NULL
++#     next()
++#   }
++#
++#   # pci fit
++#   test_pci <- test.pci(train[, i], hedge$pci$basis)
++#
++#   # summary table
++#   results <- data.table(series1 = hedge$pci$target_name, series2 = hedge$index_names)
++#   metrics <- c(hedge$pci$beta, hedge$pci$rho, hedge$pci$sigma_M, hedge$pci$sigma_R,
++#                hedge$pci$M0, hedge$pci$R0, hedge$pci$beta.se, hedge$pci$rho.se,
++#                hedge$pci$sigma_M.se, hedge$pci$sigma_R.se, hedge$pci$M0.se,
++#                hedge$pci$R0.se, hedge$pci$negloglik, hedge$pci$pvmr)
++#   names(metrics)[c(1, 7:12)] <- c("beta", "beta_se", "rho_se", "sigma_M_se", "sigma_R_se",
++#                                   "M0_se", "R0_se")
++#   metrics <- as.data.table(as.list(metrics))
++#   results <- cbind(results, metrics)
++#   pci_tests_new_i[[i]] <- cbind(results, p_rw = test_pci$p.value[1], p_ar = test_pci$p.value[2])
++# }
++# pci_tests_new <- rbindlist(pci_tests_new_i, fill = TRUE)
++#
++# # Apply restrictions to the universe
++# pci_tests_eligible_new <- pci_tests_new[pvmr > 0.5 &
++#                                           rho > 0.5 &
++#                                           p_rw < 0.05 &
++#                                           p_ar < 0.05 &
++#                                           negloglik <= quantile(negloglik, probs = 0.25)]
++#
++# # remove same pairs
++# pci_tests_eligible_new <- pci_tests_eligible_new[!(series2 %in% series1)]
++#
++# # example of partially cointegrated pairs
++# pairs <- unlist(pci_tests_eligible_new[1, 1:2])
++# plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2]))
++# # ACN  - IT usluge i savjete
++# # GOOG - Google!
++# pairs <- unlist(pci_tests_eligible_new[2, 1:2])
++# plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of second pair
++# # AEP - električna tvrtka
++# # ED  - energetskih tvrtki
++# pairs <- unlist(pci_tests_eligible_new[3, 1:2])
++# plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of second pair
++# # ALL - osiguravajuća tvrtka
++# # AFL - pružatelj dopunskog osiguranja
++#
++# # all pairs
++# pairs_results_l <- lapply(1:nrow(pci_tests_eligible_new), function(n_) {
++#   pairs_trading_pci(
++#     y1_train = train[, unlist(pci_tests_eligible_new[n_, 1])],
++#     y2_train = train[, unlist(pci_tests_eligible_new[n_, 2])],
++#     y1_test = test[, unlist(pci_tests_eligible_new[n_, 1])],
++#     y2_test = test[, unlist(pci_tests_eligible_new[n_, 2])],
++#     std_entry = 1,
++#     plot_pnl = FALSE
++#   )
++# })
++# pairs_results_new <- rbindlist(pairs_results_l)
++# pairs_results_new[, date := as.Date(date)]
++#
++# # spread all plots
++# plots <- list()
++# symbols_1 <- unique(pairs_results_new$symbol_1)
++# for (i in seq_along(symbols_1)) { # seq_along(symbols_1)
++#   data_ <- pairs_results_new[symbol_1 == symbols_1[i]]
++#   plots[[i]] <- ggplot(data_, aes(x = date, y = Z_score_M)) +
++#     geom_line() +
++#     geom_hline(yintercept = c(1, -1), color = "red") +
++#     ggtitle(paste0(data_$symbol_1[1], " - ", data_$symbol_2[2])) +
++#     theme(plot.title = element_text(size = 10),
++#           axis.title.y = element_blank())
++# }
++# wrap_plots(plots)
++#
++# # spread plots to trade
++# plots <- list()
++# # symbols_1 <- pairs_results_new[, tail(.SD, 1), by = symbol_1][Z_score_M >= 1 | Z_score_M <= -1, symbol_1]
++# symbols_1 <- unique(pairs_results_new[, any(Z_score_M >= 1) | any(Z_score_M <= -1), by = symbol_1][V1 == TRUE][[1]])
++# for (i in seq_along(symbols_1)) { # seq_along(symbols_1)
++#   data_ <- pairs_results_new[symbol_1 == symbols_1[i]]
++#   plots[[i]] <- ggplot(data_, aes(x = date, y = Z_score_M)) +
++#     geom_line() +
++#     geom_hline(yintercept = c(1, -1), color = "red") +
++#     ggtitle(paste0(data_$symbol_1[1], " - ", data_$symbol_2[2])) +
++#     theme(plot.title = element_text(size = 10),
++#           axis.title.y = element_blank())
++# }
++# wrap_plots(plots)
++#
++#
++#
++#
++# # PORTFOLIO ---------------------------------------------------------------
++# # sp500 universe
++# fmp = FMP$new()
++# symbols <- fmp$get_sp500_symbols()
++#
++# # import daily market data
++# arr <- tiledb_array("D:/equity-usa-daily-fmp",
++#                     as.data.frame = TRUE,
++#                     query_layout = "UNORDERED",
++#                     selected_ranges = list(symbol = cbind(symbols, symbols))
++# )
++# system.time(prices <- arr[])
++# tiledb_array_close(arr)
++# prices_dt <- as.data.table(prices)
++#
++# # cleaning steps with explanations
++# prices_dt <- prices_dt[isBusinessDay(date)] # keep only trading days
++# prices_dt <- prices_dt[open > 0 & high > 0 & low > 0 & close > 0 & adjClose > 0] # remove rows with prices <= 0
++# prices_dt <- prices_dt[, .(symbol, date, adjClose )] # keep only columns we need
++# prices_dt <- unique(prices_dt, by = c("symbol", "date")) # remove duplicates
++# prices_dt <- na.omit(prices_dt) # remove missing values
++# setorder(prices_dt, "symbol", "date") # order for returns calculation
++# prices_dt[, returns := adjClose / data.table::shift(adjClose, 1, type = "lag") - 1, by = symbol]
++# prices_dt <- prices_dt[returns < 1] # TODO: better outlier detection mechanism
++#
++# # define train period
++# test_period_start <- seq.Date(Sys.Date() - 7000, Sys.Date(), by = 1)
++# test_period_start <- unique(format.Date(test_period_start, format = "%Y-%m-01"))
++# test_period_start <- as.Date(test_period_start)
++# train_start <- test_period_start - (365 * 3)
++# train_stop <- test_period_start - 1
++#
++# # find best pairs for every trainset
++# bl_endp_key <- storage_endpoint(Sys.getenv("BLOB-ENDPOINT-SNP"),
++#                                 Sys.getenv("BLOB-KEY-SNP"))
++# cont <- storage_container(bl_endp_key, "qc-backtest")
++# train_start = train_start[which(test_period_start == as.Date("2004-06-01")):length(test_period_start)]
++# train_stop = train_stop[which(test_period_start == as.Date("2004-06-01")):length(test_period_start)]
++# test_period_start = test_period_start[which(test_period_start == as.Date("2004-06-01")):length(test_period_start)]
++# # best_pairs <- list()
++# for (i in seq_along(train_start)) {
++#
++#   # sample
++#   sample_dt <- prices_dt[date %between% c(train_start[i], train_stop[i])]
++#   sample_dt <- dcast(sample_dt, date ~ symbol, value.var = "adjClose")
++#
++#   # remove columns with NA values
++#   X <- as.xts.data.table(sample_dt)
++#   X <- X[,colSums(!(is.na(X))) == nrow(X)]
++#   X <- log(X)
++#
++#   # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
++#   pci_tests_i <- list()
++#   for (j in 1:ncol(X)) {
++#
++#     # quasi multivariate pairs
++#     print(j)
++#     hedge <- tryCatch(hedge.pci(X[, j], X[, -j], maxfact = 1, use.multicore = FALSE),
++#                       error = function(e) NULL)
++#     if (is.null(hedge)) {
++#       pci_tests_i[[j]] <- NULL
++#       next()
++#     }
++#
++#     # pci fit
++#     test_pci <- test.pci(X[, j], hedge$pci$basis)
++#
++#     # summary table
++#     results <- data.table(series1 = hedge$pci$target_name, series2 = hedge$index_names)
++#     metrics <- c(hedge$pci$beta, hedge$pci$rho, hedge$pci$sigma_M, hedge$pci$sigma_R,
++#                  hedge$pci$M0, hedge$pci$R0, hedge$pci$beta.se, hedge$pci$rho.se,
++#                  hedge$pci$sigma_M.se, hedge$pci$sigma_R.se, hedge$pci$M0.se,
++#                  hedge$pci$R0.se, hedge$pci$negloglik, hedge$pci$pvmr)
++#     names(metrics)[c(1, 7:12)] <- c("beta", "beta_se", "rho_se", "sigma_M_se", "sigma_R_se",
++#                                     "M0_se", "R0_se")
++#     metrics <- as.data.table(as.list(metrics))
++#     results <- cbind(results, metrics)
++#     pci_tests_i[[j]] <- cbind(results, p_rw = test_pci$p.value[1], p_ar = test_pci$p.value[2])
++#   }
++#
++#   # save to azure for qc
++#   best_pairs <- rbindlist(pci_tests_i, fill = TRUE)
++#   file_name_ <- paste0(test_period_start[i], ".csv")
++#   storage_write_csv(as.data.frame(best_pairs), cont, file_name_)
++#   # lapply(seq_along(best_pairs_eligible), function(i) {
++#   #   file_name_ <- paste0(names(best_pairs_eligible[i]), ".csv")
++#   #   print(file_name_)
++#   #   storage_write_csv(as.data.frame(best_pairs_eligible[[i]][, 1:3]), cont, file_name_)
++#   # })
++#   # best_pairs[[i]] <- rbindlist(pci_tests_i, fill = TRUE)
++# }
++#
++#
++# ######## TEST ########
++# fit.pci(X[, "ABC"], X[, "MCK"])
++# fit.pci(X[, "MCK"], X[, "ABC"])
++# ######## TEST ########
++#
++# # Apply restrictions to the universe
++# best_pairs_eligible <- copy(best_pairs)
++# names(best_pairs_eligible) <- test_period_start
++# best_pairs_eligible <- lapply(best_pairs_eligible, function(x) {
++#   x <- x[pvmr > 0.5 & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05 &
++#            negloglik <= quantile(negloglik, probs = 0.25)]
++#   x[!(series2 %in% series1)]
++# })
++#
++# # save to azure for qc
++# bl_endp_key <- storage_endpoint(Sys.getenv("BLOB-ENDPOINT-SNP"),
++#                                 Sys.getenv("BLOB-KEY-SNP"))
++# cont <- storage_container(bl_endp_key, "qc-backtest")
++# lapply(seq_along(best_pairs_eligible), function(i) {
++#   file_name_ <- paste0(names(best_pairs_eligible[i]), ".csv")
++#   print(file_name_)
++#   storage_write_csv(as.data.frame(best_pairs_eligible[[i]][, 1:3]), cont, file_name_)
++# })
++#
++#
++# # TODO:
++# # replicirati spread i trgovanje na QC.
++# # Parametri:
++# # 1) Frekventnost podataka: mnut / sat/ dan
++# # 2) Klase imovine: equity, commodity, crypto
++# # 3) trening / testing period
++# # 4) fundamental matching (sector matching)
++#
++#
++#
++# # compare QC and this script results
++# bl_endp_key <- storage_endpoint(Sys.getenv("BLOB-ENDPOINT-SNP"),
++#                                 Sys.getenv("BLOB-KEY-SNP"))
++# cont <- storage_container(bl_endp_key, "qc-backtest")
++# pairs_202101 <- storage_read_csv(cont, "2021-01-01.csv")
++#
++# # ABC - MCK
++# symbols_ <- c("ABC", "MCK")
++# arr <- tiledb_array("D:/equity-usa-daily-fmp",
++#                     as.data.frame = TRUE,
++#                     query_layout = "UNORDERED",
++#                     selected_ranges = list(date = cbind(as.Date("2018-01-01"), Sys.Date() - 1),
++#                                            symbol = cbind(symbols_, symbols_))
++# )
++# system.time(prices_ <- arr[])
++# tiledb_array_close(arr)
++# prices_dt_ <- as.data.table(prices_)
++# prices_dt_ <- prices_dt_[isBusinessDay(date)] # keep only trading days
++# prices_dt_ <- prices_dt_[open > 0 & high > 0 & low > 0 & close > 0 & adjClose > 0] # remove rows with prices <= 0
++# prices_dt_ <- prices_dt_[, .(symbol, date, adjClose )] # keep only columns we need
++# prices_dt_ <- unique(prices_dt_, by = c("symbol", "date")) # remove duplicates
++# prices_dt_ <- na.omit(prices_dt_) # remove missing values
++# setorder(prices_dt_, "symbol", "date") # order for returns calculation
++# prices_dt_[, returns := adjClose / data.table::shift(adjClose, 1, type = "lag") - 1, by = symbol]
++# prices_dt_ <- prices_dt_[returns < 1] # TODO: better outlier detection mechanism
++# test_period_start <- seq.Date(Sys.Date() - 700, Sys.Date(), by = 1)
++# test_period_start <- unique(format.Date(test_period_start, format = "%Y-%m-01"))
++# test_period_start <- as.Date(test_period_start)
++# train_start <- test_period_start - (365 * 3)
++# train_stop <- test_period_start - 1
++# y1_train <- prices_dt_[symbol == "ABC" & date %between% c(train_start[1], train_stop[1]), adjClose]
++# y2_train <- prices_dt_[symbol == "MCK" & date %between% c(train_start[1], train_stop[1]), adjClose]
++# y1_test <- prices_dt_[symbol == "ABC" & date %between% c(test_period_start[1], test_period_start[1] + 30), adjClose]
++# y2_test <- prices_dt_[symbol == "MCK" & date %between% c(test_period_start[1], test_period_start[1] + 30), adjClose]
++# library(httr)
++# library(jsonlite)
++# res <- POST("https://cgsalpha.azurewebsites.net/pairs",
++#             body = list(
++#               y1_train = toJSON(y1_train),
++#               y2_train = toJSON(y2_train),
++#               y1_test = toJSON(y1_test),
++#               y2_test = toJSON(y2_test)
++#             ))
++# spreads <- content(res)
++# train_spread <- unlist(spreads$spread_train)
++# test_spread <- unlist(spreads$spread_test)
++# spread_ <- c(train_spread, test_spread)
++# spread_z_ <- (spread_ - mean(train_spread)) / sd(train_spread)
++# dates_ <- prices_dt_[date %between% c(train_start[1], test_period_start[1] + 30), unique(date)]
++# spread_final <- cbind.data.frame(date = dates_, spread = spread_z_)
++# ggplot(spread_final, aes(x = date, y = spread)) +
++#   geom_line() +
++#   geom_hline(yintercept = c(1, -1), color = "blue") +
++#   geom_vline(xintercept = c(train_stop[1]), color = "red")
++# ggplot(spread_final[spread_final$date > as.Date(test_period_start[1]),], aes(x = date, y = spread)) +
++#   geom_line() +
++#   geom_hline(yintercept = c(1, -1), color = "blue") +
++#   geom_vline(xintercept = c(train_stop[1]), color = "red")
++#
++#
++# # tet if API endpoinr works as expected
++# # y1_train <- rnorm(500)
++# # y2_train <- rnorm(500)
++# # y1_test <- rnorm(500)
++# # y2_test <- rnorm(500)
++# #
++# #
++# # res <- POST("http://127.0.0.1:8000/pairs",
++# #             body = list(
++# #               y1_train = toJSON(rnorm(500)),
++# #               y2_train = toJSON(rnorm(500)),
++# #               y1_test = toJSON(rnorm(500)),
++# #               y2_test = toJSON(rnorm(500))
++# #             ))
++# # x <- content(res)
++# # unlist(x$spread_train)
+
+abd09773dfb37079956c4ff4b1afb7e6f9965f24 MislavSag Wed Dec 11 12:57:31 2024 +0100 update
+diff --git a/.gitignore b/.gitignore
+index 5b6a065..221b531 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,4 @@
+ .Rhistory
+ .RData
+ .Ruserdata
++.Renviron
+
+17b8bf36d55f319c074fdd9ef434f048bccc5a9d MislavSag Wed Dec 11 12:56:37 2024 +0100 update
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 1a0f091..91b7599 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -17,7 +17,7 @@ if (interactive()) {
+ # PREPARE DATA ------------------------------------------------------------
+ # i'th row from meta
+ if (interactive()) {
+-  i = 1234
++  i = 1
+ } else {
+   i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
+ }
+@@ -49,6 +49,7 @@ for (j in 1:ncol(train)) { # ncol(train)
+ 
+   # DEBUG
+   print(j)
++  # j = which(names(train) == "abh")
+ 
+   # quasi multivariate pairs
+   hedge = tryCatch(hedge.pci(train[, j], train[, -j],
+@@ -100,6 +101,10 @@ for (j in 1:ncol(train)) { # ncol(train)
+   metrics = as.data.table(as.list(metrics))
+   results = cbind(results, metrics)
+ 
++  # TEST: Compare to fit.pci
++  # fit.pci(train[, j], train[, "cha.1"])
++  # train[, c("abh", "cha.1")]
++
+   pci_tests_i[[j]] = cbind(search_type = param_search_type,
+                            maxfact = param_maxfact,
+                            train_size = meta[i, train_size],
+
+cfa4bf3700c42238b79c2e46c42e9225ffff7751 MislavSag Tue Dec 3 15:29:17 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index ec8d619..1a0f091 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -45,7 +45,7 @@ param_maxfact = meta[i, maxfact]
+ # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
+ pci_tests_i = list()
+ s = Sys.time()
+-for (j in 1:ncol(train)) {
++for (j in 1:ncol(train)) { # ncol(train)
+ 
+   # DEBUG
+   print(j)
+
+f46cc542a8affcde7c261a1cab8958494bdf4e93 MislavSag Tue Dec 3 15:23:51 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index ce30137..ec8d619 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -90,17 +90,22 @@ for (j in 1:ncol(train)) {
+   # Change names
+   names(metrics)[names(metrics) %in% names(hedge$pci$beta)] = paste0("beta_", seq_along(hedge$pci$beta))
+   names(metrics)[names(metrics) %in% names(hedge$pci$beta.se)] = paste0("beta_", seq_along(hedge$pci$beta.se), "_se")
+-  names(metrics)[names(metrics) %in% names(hedge$pci$rho.se)] = "rho_se"
+-  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_M.se)] = "sigma_M_se"
+-  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_R.se)] = "sigma_R_se"
+-  names(metrics)[names(metrics) %in% names(hedge$pci$M0.se)] = "M0_se"
+-  names(metrics)[names(metrics) %in% names(hedge$pci$R0.se)] = "R0_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$rho.se)][2] = "rho_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_M.se)][2] = "sigma_M_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_R.se)][2] = "sigma_R_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$M0.se)][2] = "M0_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$R0.se)][2] = "R0_se"
+ 
+   # Convert to data.table, add resulsts to metricsa and p values
+   metrics = as.data.table(as.list(metrics))
+   results = cbind(results, metrics)
+ 
+-  pci_tests_i[[j]] = cbind(results,
++  pci_tests_i[[j]] = cbind(search_type = param_search_type,
++                           maxfact = param_maxfact,
++                           train_size = meta[i, train_size],
++                           train_start = meta[i, train_start],
++                           train_end = meta[i, train_end],
++                           results,
+                            p_rw = test_pci$p.value[1],
+                            p_ar = test_pci$p.value[2])
+ }
+diff --git a/results_pci.R b/results_pci.R
+new file mode 100644
+index 0000000..0d35ac3
+--- /dev/null
++++ b/results_pci.R
+@@ -0,0 +1,43 @@
++library(data.table)
++
++
++# Import meta
++meta = fread("F:/strategies/statsarb/pci/meta.csv")
++
++# Import pci tests
++files = list.files("F:/strategies/statsarb/pci/output_pci", full.names = TRUE)
++indecies_meta = basename(files)
++pci_tests = lapply(files, fread)
++pci_tests = rbindlist(pci_tests, fill = TRUE)
++
++# Apply restrictions to the universe
++# 1) pairs with a half-life of mean-reversion of one day or less - thereby avoiding to select
++#where trading gains are largely attributable to bid-ask bounce
++# 2) pvmr > 0.5 ensures    pairs  more reliable parameter estimates
++# 3) p_rw < 0.05 & p_ar < 0.05. A time series is classified as partially cointegrated,
++#    if and only if the random walk as well as the AR(1)-hypotheses are rejected
++# 3) my condition: MR p value should be lower than 0.05 because this test confirms mean reverting component
++# 4) restriction to same sector I DON'T WANT APPLY THIS FOR  NOW
++# 5) 25% lowest  by neLog
++# 6) possible to add additional fundamental matching
++pci_tests_eligible = pci_tests[pvmr > 0.5  & rho > 0.5 & p_rw < 0.05 & p_ar < 0.05 &
++                                 negloglik <= quantile(negloglik, probs = 0.25)] # 1), 2), 3), 5)
++
++# remove same pairs
++pci_tests_eligible = pci_tests_eligible[!(series_2 %in% series_1)]
++
++# example of partially cointegrated pairs
++pairs = unlist(pci_tests_eligible[1, 1:2])
++plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of first pair
++# EQIX - Equinix, Inc. je američka multinacionalna tvrtka sa sjedištem u Redwood Cityju, Kalifornija,
++#        specijalizirana za internetske veze i podatkovne centre.
++# AMT - American Tower Corporation je američka zaklada za ulaganje u nekretnine te vlasnik i operater bežične i
++#       televizijske komunikacijske infrastrukture u nekoliko zemalja
++pairs <- unlist(pci_tests_eligible[2, 1:2])
++plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of second pair
++# DOV - američki je konglomerat proizvođača industrijskih proizvod
++# APH - glavni proizvođač elektroničkih i optičkih konektora, kabelskih i interkonektnih sustava kao što su koaksijalni kabeli
++pairs = unlist(pci_tests_eligible[3, 1:2])
++plot(log(train[, pairs]), main = paste0(pairs[1], " - ", pairs[2])) # log prices series of third pair
++# O - investicijski fond za nekretnine
++# CPT - investicijski fond za nekretnine
+
+da6ba5e316271a99795794e645ff514b073eec3f MislavSag Tue Dec 3 14:57:39 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 3b36f28..ce30137 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -45,7 +45,7 @@ param_maxfact = meta[i, maxfact]
+ # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
+ pci_tests_i = list()
+ s = Sys.time()
+-for (j in 1:10) { # ncol(train)
++for (j in 1:ncol(train)) {
+ 
+   # DEBUG
+   print(j)
+
+85945577524326323047a55ac28d9a2da242c928 MislavSag Tue Dec 3 14:33:35 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.sh b/estimate_pci_padobran.sh
+index 58b008c..be917b3 100644
+--- a/estimate_pci_padobran.sh
++++ b/estimate_pci_padobran.sh
+@@ -3,7 +3,7 @@
+ 
+ #PBS -N STATSARBPCI
+ #PBS -l ncpus=2
+-#PBS -l mem=10GB
++#PBS -l mem=16GB
+ #PBS -J 1-3060
+ #PBS -o logs
+ #PBS -j oe
+
+e5708b07aeb40776880944ae3cac46ca3303deef MislavSag Tue Dec 3 14:32:41 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 8dd3cfe..3b36f28 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -53,7 +53,7 @@ for (j in 1:10) { # ncol(train)
+   # quasi multivariate pairs
+   hedge = tryCatch(hedge.pci(train[, j], train[, -j],
+                              maxfact = param_maxfact,
+-                             use.multicore = TRUE,
++                             use.multicore = FALSE,
+                              search_type = param_search_type),
+                    error = function(e) NULL)
+   if (is.null(hedge)) {
+diff --git a/estimate_pci_padobran.sh b/estimate_pci_padobran.sh
+index 42cf647..58b008c 100644
+--- a/estimate_pci_padobran.sh
++++ b/estimate_pci_padobran.sh
+@@ -3,7 +3,7 @@
+ 
+ #PBS -N STATSARBPCI
+ #PBS -l ncpus=2
+-#PBS -l mem=6GB
++#PBS -l mem=10GB
+ #PBS -J 1-3060
+ #PBS -o logs
+ #PBS -j oe
+diff --git a/prepare_pci.R b/prepare_pci.R
+index 0b2a665..5256c03 100644
+--- a/prepare_pci.R
++++ b/prepare_pci.R
+@@ -152,7 +152,7 @@ sh_file = sprintf("
+ 
+ #PBS -N STATSARBPCI
+ #PBS -l ncpus=2
+-#PBS -l mem=6GB
++#PBS -l mem=10GB
+ #PBS -J 1-%d
+ #PBS -o logs
+ #PBS -j oe
+
+f06c3c4c26b64c9954e152ddf5bd425eb59ad428 MislavSag Tue Dec 3 14:24:16 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 2771773..8dd3cfe 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -1,6 +1,6 @@
+-library(data.table)
+-library(xts)
+-library(partialCI)
++suppressMessages(library(data.table))
++suppressMessages(library(xts))
++suppressMessages(library(partialCI))
+ 
+ 
+ # IMPORT DATA -------------------------------------------------------------
+@@ -45,7 +45,7 @@ param_maxfact = meta[i, maxfact]
+ # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
+ pci_tests_i = list()
+ s = Sys.time()
+-for (j in 1:ncol(train)) {
++for (j in 1:10) { # ncol(train)
+ 
+   # DEBUG
+   print(j)
+
+a2fdd6c22c40a355a139555456a23877983c0819 MislavSag Tue Dec 3 14:20:01 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 7c4bb8c..2771773 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -45,7 +45,7 @@ param_maxfact = meta[i, maxfact]
+ # choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
+ pci_tests_i = list()
+ s = Sys.time()
+-for (j in 1:10) { # 1:ncol(train)
++for (j in 1:ncol(train)) {
+ 
+   # DEBUG
+   print(j)
+
+c03a31b808f3b36602e115664656a37de6194799 MislavSag Tue Dec 3 14:18:56 2024 +0100 solve bugs for padobrn
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index c1ab7ac..7c4bb8c 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -3,144 +3,24 @@ library(xts)
+ library(partialCI)
+ 
+ 
+-# PARAMS ------------------------------------------------------------------
+-# Parameters
+-FREQ = "m" # Frequency - for now I would suggest month (m) and week (w)
+-
+-
+-# PRICE DATA --------------------------------------------------------------
+-# Import QC daily data
+-prices = fread("F:/lean/data/stocks_daily.csv")
+-setnames(prices, gsub(" ", "_", c(tolower(colnames(prices)))))
+-
+-# Remove duplicates
+-prices = unique(prices, by = c("symbol", "date"))
+-
+-# Remove duplicates - there are same for different symbols (eg. phun and phun.1)
+-dups = prices[, .(symbol , n = .N),
+-              by = .(date, open, high, low, close, volume, adj_close,
+-                     symbol_first = substr(symbol, 1, 1))]
+-dups = dups[n > 1]
+-dups[, symbol_short := gsub("\\.\\d$", "", symbol)]
+-symbols_remove = dups[, .(symbol, n = .N),
+-                      by = .(date, open, high, low, close, volume, adj_close,
+-                             symbol_short)]
+-symbols_remove[n >= 2, unique(symbol)]
+-symbols_remove = symbols_remove[n >= 2, unique(symbol)]
+-symbols_remove = symbols_remove[grepl("\\.", symbols_remove)]
+-prices = prices[symbol %notin% symbols_remove]
+-
+-# Adjust all columns
+-prices[, adj_rate := adj_close / close]
+-prices[, let(
+-  open = open*adj_rate,
+-  high = high*adj_rate,
+-  low = low*adj_rate
+-)]
+-setnames(prices, "close", "close_raw")
+-setnames(prices, "adj_close", "close")
+-prices[, let(adj_rate = NULL)]
+-setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"))
+-
+-# Remove observations where open, high, low, close columns are below 1e-008
+-# This step is opional, we need it if we will use finfeatures package
+-prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
+-
+-# Remove missing values
+-prices = na.omit(prices)
+-
+-# Keep only symbol with at least 2 years of data
+-# This step is optional
+-symbol_keep = prices[, .N, symbol][N >= 2 * 252, symbol]
+-prices = prices[symbol %chin% symbol_keep]
+-
+-# Sort
+-setorder(prices, symbol, date)
+-
+-# free memory
+-gc()
+-
+-
+-# FILTERING ---------------------------------------------------------------
+-# Add label for most liquid asssets
+-prices[, dollar_volume_month := frollsum(close_raw * volume, 22, na.rm= TRUE), by = symbol]
+-calculate_liquid = function(prices, n) {
+-  # dt = copy(prices)
+-  # n = 500
+-  dt = copy(prices)
+-  setorder(dt, date, -dollar_volume_month)
+-  filtered = na.omit(dt)[, .(symbol = first(symbol, n)), by = date]
+-  col_ = paste0("liquid_", n)
+-  filtered[, (col_) := TRUE]
+-  dt = filtered[dt, on = c("date", "symbol")]
+-  dt[is.na(x), x := FALSE, env = list(x = col_)] # fill NA with FALSE
+-  return(dt)
++# IMPORT DATA -------------------------------------------------------------
++# Import prices and meta
++if (interactive()) {
++  prices = fread("F:/strategies/statsarb/pci/prices.csv")
++  meta = fread("F:/strategies/statsarb/pci/meta.csv")
++} else {
++  meta = fread("meta.csv")
++  prices = fread("prices.csv")
+ }
+-prices = calculate_liquid(prices, 100)
+-prices = calculate_liquid(prices, 200)
+-prices = calculate_liquid(prices, 500)
+-prices = calculate_liquid(prices, 1000)
+-
+-# Remove columns we don't need
+-prices[, dollar_volume_month := NULL]
+-
+-# Order again
+-setorder(prices, symbol, date)
+-
+-
+-# PARAMETERS --------------------------------------------------------------
+-# Define parameters
+-train_size_years = c(2, 5, 10)
+-
+-# Create sh file with one node for every parameter
+-dates = seq.Date(prices[, min(date)], prices[, max(date)], by = "months")
+-
+-# Util function that creates train and test sets
+-create_rolling_splits = function(dates, train_size = 12, test_size = 1) {
+-  # Ensure the dates are sorted
+-  dates = sort(dates)
+-  dates_dt = data.table(date = dates)
+-
+-  # Initialize a list to store the train-test splits
+-  splits_list = list()
+-
+-  total_periods = nrow(dates_dt)
+-
+-  # Loop over each possible split point
+-  for (i in seq(train_size + 1, total_periods - test_size + 1)) {
+-    # Training indices
+-    train_indices = seq(i - train_size, i - 1)
+-
+-    # Testing indices
+-    test_indices = seq(i, i + test_size - 1)
+-
+-    # Store the indices in the splits list
+-    splits_list[[length(splits_list) + 1]] = data.table(
+-      train_size = train_size,
+-      test_size = test_size,
+-      train_start = dates[first(train_indices)],
+-      train_end = dates[last(train_indices)],
+-      test_start = dates[first(test_indices)],
+-      test_end = dates[last(test_indices)]
+-    )
+-  }
+-
+-  rbindlist(splits_list)
+-}
+-
+-# Create train/test splits
+-meta = lapply(train_size_years, function(x) create_rolling_splits(dates, x*12, 1))
+-meta = rbindlist(meta)
+-
+-# Add search_type and maxfact option from hedge.pci
+-CJ_table_1 = function(X,Y) setkey(X[,c(k=1,.SD)],k)[Y[,c(k=1,.SD)],allow.cartesian=TRUE][,k:=NULL]
+-meta = CJ_table_1(meta, data.table(search_type = c("lasso", "limited")))
+-meta = CJ_table_1(meta, data.table(maxfact = 1:2))
+ 
+ 
+ # PREPARE DATA ------------------------------------------------------------
+ # i'th row from meta
+-i = 2000
++if (interactive()) {
++  i = 1234
++} else {
++  i = as.integer(Sys.getenv('PBS_ARRAY_INDEX'))
++}
+ 
+ # Take data_sample
+ train_dt = prices[date %between% c(meta[i, train_start], meta[i, train_end])]
+
+6b9b52d7a558b2def43b2d1acdaa757de5b46fa2 MislavSag Tue Dec 3 13:25:16 2024 +0100 sh file
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+index 6405434..c1ab7ac 100644
+--- a/estimate_pci_padobran.R
++++ b/estimate_pci_padobran.R
+@@ -173,7 +173,7 @@ for (j in 1:10) { # 1:ncol(train)
+   # quasi multivariate pairs
+   hedge = tryCatch(hedge.pci(train[, j], train[, -j],
+                              maxfact = param_maxfact,
+-                             use.multicore = FALSE,
++                             use.multicore = TRUE,
+                              search_type = param_search_type),
+                    error = function(e) NULL)
+   if (is.null(hedge)) {
+diff --git a/estimate_pci_padobran.sh b/estimate_pci_padobran.sh
+new file mode 100644
+index 0000000..42cf647
+--- /dev/null
++++ b/estimate_pci_padobran.sh
+@@ -0,0 +1,13 @@
++
++#!/bin/bash
++
++#PBS -N STATSARBPCI
++#PBS -l ncpus=2
++#PBS -l mem=6GB
++#PBS -J 1-3060
++#PBS -o logs
++#PBS -j oe
++
++cd ${PBS_O_WORKDIR}
++apptainer run image.sif estimate_pci_padobran.R
++
+diff --git a/prepare_pci.R b/prepare_pci.R
+index ea4f344..0b2a665 100644
+--- a/prepare_pci.R
++++ b/prepare_pci.R
+@@ -138,6 +138,7 @@ meta = CJ_table_1(meta, data.table(maxfact = 1:2))
+ # Add to padobran
+ fwrite(meta, "F:/strategies/statsarb/pci/meta.csv")
+ fwrite(prices, "F:/strategies/statsarb/pci/prices.csv")
++# If on windows use winscp, otherwise use commands below
+ # scp F:/strategies/statsarb/pci/meta.csv padobran:/home/jmaric/predictors_padobran/
+ # scp /home/sn/data/strategies/pread/ padobran:/home/jmaric/pread/predictors_padobran/
+ file.remove("F:/strategies/statsarb/pci/meta.csv")
+
+e4ec87d4f5da7039533dad91d6b09f3a3a9fd57d MislavSag Tue Dec 3 13:01:31 2024 +0100 init
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..5b6a065
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,4 @@
++.Rproj.user
++.Rhistory
++.RData
++.Ruserdata
+diff --git a/estimate_pci_padobran.R b/estimate_pci_padobran.R
+new file mode 100644
+index 0000000..6405434
+--- /dev/null
++++ b/estimate_pci_padobran.R
+@@ -0,0 +1,235 @@
++library(data.table)
++library(xts)
++library(partialCI)
++
++
++# PARAMS ------------------------------------------------------------------
++# Parameters
++FREQ = "m" # Frequency - for now I would suggest month (m) and week (w)
++
++
++# PRICE DATA --------------------------------------------------------------
++# Import QC daily data
++prices = fread("F:/lean/data/stocks_daily.csv")
++setnames(prices, gsub(" ", "_", c(tolower(colnames(prices)))))
++
++# Remove duplicates
++prices = unique(prices, by = c("symbol", "date"))
++
++# Remove duplicates - there are same for different symbols (eg. phun and phun.1)
++dups = prices[, .(symbol , n = .N),
++              by = .(date, open, high, low, close, volume, adj_close,
++                     symbol_first = substr(symbol, 1, 1))]
++dups = dups[n > 1]
++dups[, symbol_short := gsub("\\.\\d$", "", symbol)]
++symbols_remove = dups[, .(symbol, n = .N),
++                      by = .(date, open, high, low, close, volume, adj_close,
++                             symbol_short)]
++symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[grepl("\\.", symbols_remove)]
++prices = prices[symbol %notin% symbols_remove]
++
++# Adjust all columns
++prices[, adj_rate := adj_close / close]
++prices[, let(
++  open = open*adj_rate,
++  high = high*adj_rate,
++  low = low*adj_rate
++)]
++setnames(prices, "close", "close_raw")
++setnames(prices, "adj_close", "close")
++prices[, let(adj_rate = NULL)]
++setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"))
++
++# Remove observations where open, high, low, close columns are below 1e-008
++# This step is opional, we need it if we will use finfeatures package
++prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
++
++# Remove missing values
++prices = na.omit(prices)
++
++# Keep only symbol with at least 2 years of data
++# This step is optional
++symbol_keep = prices[, .N, symbol][N >= 2 * 252, symbol]
++prices = prices[symbol %chin% symbol_keep]
++
++# Sort
++setorder(prices, symbol, date)
++
++# free memory
++gc()
++
++
++# FILTERING ---------------------------------------------------------------
++# Add label for most liquid asssets
++prices[, dollar_volume_month := frollsum(close_raw * volume, 22, na.rm= TRUE), by = symbol]
++calculate_liquid = function(prices, n) {
++  # dt = copy(prices)
++  # n = 500
++  dt = copy(prices)
++  setorder(dt, date, -dollar_volume_month)
++  filtered = na.omit(dt)[, .(symbol = first(symbol, n)), by = date]
++  col_ = paste0("liquid_", n)
++  filtered[, (col_) := TRUE]
++  dt = filtered[dt, on = c("date", "symbol")]
++  dt[is.na(x), x := FALSE, env = list(x = col_)] # fill NA with FALSE
++  return(dt)
++}
++prices = calculate_liquid(prices, 100)
++prices = calculate_liquid(prices, 200)
++prices = calculate_liquid(prices, 500)
++prices = calculate_liquid(prices, 1000)
++
++# Remove columns we don't need
++prices[, dollar_volume_month := NULL]
++
++# Order again
++setorder(prices, symbol, date)
++
++
++# PARAMETERS --------------------------------------------------------------
++# Define parameters
++train_size_years = c(2, 5, 10)
++
++# Create sh file with one node for every parameter
++dates = seq.Date(prices[, min(date)], prices[, max(date)], by = "months")
++
++# Util function that creates train and test sets
++create_rolling_splits = function(dates, train_size = 12, test_size = 1) {
++  # Ensure the dates are sorted
++  dates = sort(dates)
++  dates_dt = data.table(date = dates)
++
++  # Initialize a list to store the train-test splits
++  splits_list = list()
++
++  total_periods = nrow(dates_dt)
++
++  # Loop over each possible split point
++  for (i in seq(train_size + 1, total_periods - test_size + 1)) {
++    # Training indices
++    train_indices = seq(i - train_size, i - 1)
++
++    # Testing indices
++    test_indices = seq(i, i + test_size - 1)
++
++    # Store the indices in the splits list
++    splits_list[[length(splits_list) + 1]] = data.table(
++      train_size = train_size,
++      test_size = test_size,
++      train_start = dates[first(train_indices)],
++      train_end = dates[last(train_indices)],
++      test_start = dates[first(test_indices)],
++      test_end = dates[last(test_indices)]
++    )
++  }
++
++  rbindlist(splits_list)
++}
++
++# Create train/test splits
++meta = lapply(train_size_years, function(x) create_rolling_splits(dates, x*12, 1))
++meta = rbindlist(meta)
++
++# Add search_type and maxfact option from hedge.pci
++CJ_table_1 = function(X,Y) setkey(X[,c(k=1,.SD)],k)[Y[,c(k=1,.SD)],allow.cartesian=TRUE][,k:=NULL]
++meta = CJ_table_1(meta, data.table(search_type = c("lasso", "limited")))
++meta = CJ_table_1(meta, data.table(maxfact = 1:2))
++
++
++# PREPARE DATA ------------------------------------------------------------
++# i'th row from meta
++i = 2000
++
++# Take data_sample
++train_dt = prices[date %between% c(meta[i, train_start], meta[i, train_end])]
++train_dt = dcast(train_dt[, .(symbol, date, close)],
++                 date ~ symbol, value.var = "close")
++
++# Keep only symbols with almost no NA values
++keep_cols = names(which(colMeans(!is.na(train_dt)) > 0.99))
++train_dt = train_dt[, .SD, .SDcols = keep_cols]
++
++# Convert to xts and take logs
++train = as.xts.data.table(train_dt) # convert to xts
++train = train[, colSums(!is.na(train)) == max(colSums(!is.na(train)))]
++train = log(train)
++
++# Other parameteres
++param_search_type = meta[i, search_type]
++param_maxfact = meta[i, maxfact]
++
++
++# COARSE BEST PAIRS -------------------------------------------------------
++# choose best pairs using hedge.pci function and maxfact = 1 (only one factor possible)
++pci_tests_i = list()
++s = Sys.time()
++for (j in 1:10) { # 1:ncol(train)
++
++  # DEBUG
++  print(j)
++
++  # quasi multivariate pairs
++  hedge = tryCatch(hedge.pci(train[, j], train[, -j],
++                             maxfact = param_maxfact,
++                             use.multicore = FALSE,
++                             search_type = param_search_type),
++                   error = function(e) NULL)
++  if (is.null(hedge)) {
++    pci_tests_i[[j]] = NULL
++    next()
++  }
++
++  # pci fit
++  test_pci = test.pci(train[, j], hedge$pci$basis)
++
++  # summary table
++  results = data.table(t(hedge$index_names))
++  names(results) = paste0("series_", seq_along(results) + 1)
++  results = cbind(series_1 = hedge$pci$target_name, results)
++
++  # summary table
++  metrics = c(
++    hedge$pci$beta,
++    hedge$pci$rho,
++    hedge$pci$sigma_M,
++    hedge$pci$sigma_R,
++    hedge$pci$M0,
++    hedge$pci$R0,
++    hedge$pci$beta.se,
++    hedge$pci$rho.se,
++    hedge$pci$sigma_M.se,
++    hedge$pci$sigma_R.se,
++    hedge$pci$M0.se,
++    hedge$pci$R0.se,
++    hedge$pci$negloglik,
++    hedge$pci$pvmr
++  )
++
++  # Change names
++  names(metrics)[names(metrics) %in% names(hedge$pci$beta)] = paste0("beta_", seq_along(hedge$pci$beta))
++  names(metrics)[names(metrics) %in% names(hedge$pci$beta.se)] = paste0("beta_", seq_along(hedge$pci$beta.se), "_se")
++  names(metrics)[names(metrics) %in% names(hedge$pci$rho.se)] = "rho_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_M.se)] = "sigma_M_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$sigma_R.se)] = "sigma_R_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$M0.se)] = "M0_se"
++  names(metrics)[names(metrics) %in% names(hedge$pci$R0.se)] = "R0_se"
++
++  # Convert to data.table, add resulsts to metricsa and p values
++  metrics = as.data.table(as.list(metrics))
++  results = cbind(results, metrics)
++
++  pci_tests_i[[j]] = cbind(results,
++                           p_rw = test_pci$p.value[1],
++                           p_ar = test_pci$p.value[2])
++}
++e = Sys.time()
++print(e - s)
++pci_tests = rbindlist(pci_tests_i, fill = TRUE)
++
++# Save
++dir_ = "output_pci"
++if (!dir.exists(dir_)) dir.create(dir_)
++file_name = file.path("output_pci", paste0(i, ".csv"))
++fwrite(pci_tests, file_name)
+diff --git a/image.def b/image.def
+new file mode 100644
+index 0000000..112bd70
+--- /dev/null
++++ b/image.def
+@@ -0,0 +1,20 @@
++Bootstrap: docker
++From: r-base:4.4.0
++
++%post
++
++  # apt
++  apt update
++  apt install libssl-dev -y
++  apt install libxml2-dev -y
++  apt install libcurl4-openssl-dev -y
++
++  # mlr3
++  R --slave -e 'install.packages("data.table")'
++  R --slave -e 'install.packages("xts")'
++  R --slave -e 'install.packages("remotes")'
++  R --slave -e 'remotes::install_github("https://github.com/MislavSag/partialAR")'
++  R --slave -e 'remotes::install_github("https://github.com/matthewclegg/partialCI")'
++
++%runscript
++  Rscript $@
+diff --git a/image.sh b/image.sh
+new file mode 100644
+index 0000000..dcd2d1e
+--- /dev/null
++++ b/image.sh
+@@ -0,0 +1,3 @@
++#!/bin/bash
++
++apptainer build image.sif image.def
+diff --git a/prepare_pci.R b/prepare_pci.R
+new file mode 100644
+index 0000000..ea4f344
+--- /dev/null
++++ b/prepare_pci.R
+@@ -0,0 +1,164 @@
++library(data.table)
++
++
++# PARAMS ------------------------------------------------------------------
++# Parameters
++FREQ = "m" # Frequency - for now I would suggest month (m) and week (w)
++
++
++# PRICE DATA --------------------------------------------------------------
++# Import QC daily data
++prices = fread("F:/lean/data/stocks_daily.csv")
++setnames(prices, gsub(" ", "_", c(tolower(colnames(prices)))))
++
++# Remove duplicates
++prices = unique(prices, by = c("symbol", "date"))
++
++# Remove duplicates - there are same for different symbols (eg. phun and phun.1)
++dups = prices[, .(symbol , n = .N),
++              by = .(date, open, high, low, close, volume, adj_close,
++                     symbol_first = substr(symbol, 1, 1))]
++dups = dups[n > 1]
++dups[, symbol_short := gsub("\\.\\d$", "", symbol)]
++symbols_remove = dups[, .(symbol, n = .N),
++                      by = .(date, open, high, low, close, volume, adj_close,
++                             symbol_short)]
++symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[n >= 2, unique(symbol)]
++symbols_remove = symbols_remove[grepl("\\.", symbols_remove)]
++prices = prices[symbol %notin% symbols_remove]
++
++# Adjust all columns
++prices[, adj_rate := adj_close / close]
++prices[, let(
++  open = open*adj_rate,
++  high = high*adj_rate,
++  low = low*adj_rate
++)]
++setnames(prices, "close", "close_raw")
++setnames(prices, "adj_close", "close")
++prices[, let(adj_rate = NULL)]
++setcolorder(prices, c("symbol", "date", "open", "high", "low", "close", "volume"))
++
++# Remove observations where open, high, low, close columns are below 1e-008
++# This step is opional, we need it if we will use finfeatures package
++prices = prices[open > 1e-008 & high > 1e-008 & low > 1e-008 & close > 1e-008]
++
++# Remove missing values
++prices = na.omit(prices)
++
++# Keep only symbol with at least 2 years of data
++# This step is optional
++symbol_keep = prices[, .N, symbol][N >= 2 * 252, symbol]
++prices = prices[symbol %chin% symbol_keep]
++
++# Sort
++setorder(prices, symbol, date)
++
++# free memory
++gc()
++
++
++# FILTERING ---------------------------------------------------------------
++# Add label for most liquid asssets
++prices[, dollar_volume_month := frollsum(close_raw * volume, 22, na.rm= TRUE), by = symbol]
++calculate_liquid = function(prices, n) {
++  # dt = copy(prices)
++  # n = 500
++  dt = copy(prices)
++  setorder(dt, date, -dollar_volume_month)
++  filtered = na.omit(dt)[, .(symbol = first(symbol, n)), by = date]
++  col_ = paste0("liquid_", n)
++  filtered[, (col_) := TRUE]
++  dt = filtered[dt, on = c("date", "symbol")]
++  dt[is.na(x), x := FALSE, env = list(x = col_)] # fill NA with FALSE
++  return(dt)
++}
++prices = calculate_liquid(prices, 100)
++prices = calculate_liquid(prices, 200)
++prices = calculate_liquid(prices, 500)
++prices = calculate_liquid(prices, 1000)
++
++# Remove columns we don't need
++prices[, dollar_volume_month := NULL]
++
++# Order again
++setorder(prices, symbol, date)
++
++
++# PARAMETERS --------------------------------------------------------------
++# Define parameters
++train_size_years = c(2, 5, 10)
++
++# Create sh file with one node for every parameter
++dates = seq.Date(prices[, min(date)], prices[, max(date)], by = "months")
++
++# Util function that creates train and test sets
++create_rolling_splits = function(dates, train_size = 12, test_size = 1) {
++  # Ensure the dates are sorted
++  dates = sort(dates)
++  dates_dt = data.table(date = dates)
++
++  # Initialize a list to store the train-test splits
++  splits_list = list()
++
++  total_periods = nrow(dates_dt)
++
++  # Loop over each possible split point
++  for (i in seq(train_size + 1, total_periods - test_size + 1)) {
++    # Training indices
++    train_indices = seq(i - train_size, i - 1)
++
++    # Testing indices
++    test_indices = seq(i, i + test_size - 1)
++
++    # Store the indices in the splits list
++    splits_list[[length(splits_list) + 1]] = data.table(
++      train_size = train_size,
++      test_size = test_size,
++      train_start = dates[first(train_indices)],
++      train_end = dates[last(train_indices)],
++      test_start = dates[first(test_indices)],
++      test_end = dates[last(test_indices)]
++    )
++  }
++
++  rbindlist(splits_list)
++}
++
++# Create train/test splits
++meta = lapply(train_size_years, function(x) create_rolling_splits(dates, x*12, 1))
++meta = rbindlist(meta)
++
++# Add search_type and maxfact option from hedge.pci
++CJ_table_1 = function(X,Y) setkey(X[,c(k=1,.SD)],k)[Y[,c(k=1,.SD)],allow.cartesian=TRUE][,k:=NULL]
++meta = CJ_table_1(meta, data.table(search_type = c("lasso", "limited")))
++meta = CJ_table_1(meta, data.table(maxfact = 1:2))
++
++# Add to padobran
++fwrite(meta, "F:/strategies/statsarb/pci/meta.csv")
++fwrite(prices, "F:/strategies/statsarb/pci/prices.csv")
++# scp F:/strategies/statsarb/pci/meta.csv padobran:/home/jmaric/predictors_padobran/
++# scp /home/sn/data/strategies/pread/ padobran:/home/jmaric/pread/predictors_padobran/
++file.remove("F:/strategies/statsarb/pci/meta.csv")
++file.remove("F:/strategies/statsarb/pci/prices.csv")
++
++
++# SH FILE -----------------------------------------------------------------
++# Create sh file for padobran with PBS j equal to number of rows
++sh_file = sprintf("
++#!/bin/bash
++
++#PBS -N STATSARBPCI
++#PBS -l ncpus=2
++#PBS -l mem=6GB
++#PBS -J 1-%d
++#PBS -o logs
++#PBS -j oe
++
++cd ${PBS_O_WORKDIR}
++apptainer run image.sif estimate_pci_padobran.R
++", nrow(meta))
++sh_file_name = "estimate_pci_padobran.sh"
++file.create(sh_file_name)
++writeLines(sh_file, sh_file_name)
+diff --git a/statistical_arbitrage_alpha.Rproj b/statistical_arbitrage_alpha.Rproj
+new file mode 100644
+index 0000000..e83436a
+--- /dev/null
++++ b/statistical_arbitrage_alpha.Rproj
+@@ -0,0 +1,16 @@
++Version: 1.0
++
++RestoreWorkspace: Default
++SaveWorkspace: Default
++AlwaysSaveHistory: Default
++
++EnableCodeIndexing: Yes
++UseSpacesForTab: Yes
++NumSpacesForTab: 2
++Encoding: UTF-8
++
++RnwWeave: Sweave
++LaTeX: pdfLaTeX
++
++AutoAppendNewline: Yes
++StripTrailingWhitespace: Yes
