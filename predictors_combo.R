@@ -12,7 +12,7 @@ profile = unique(profile[, .(fmp_symbol = symbol, industry, sector, isEtf, isFun
 
 # Import data
 paths = list.files(file.path(PATH, "predictors"), full.names = TRUE)
-pairs = lapply(paths[1:20], read_feather)
+pairs = lapply(paths, read_feather)
 pairs = rbindlist(pairs)
 
 # Check unique dates

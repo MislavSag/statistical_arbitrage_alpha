@@ -9,6 +9,7 @@ library(arrow)
 library(patchwork)
 library(qlcal)
 library(arrow)
+library(lubridate)
 
 # TODO:
 # 1) sum 1/0 (buy/sell) and buy stock with highest number of buys
@@ -75,10 +76,10 @@ pairs[, .N, by = date][order(date)] |>
   labs(title = "Number of pairs by quarter", x = "Quantile", y = "Number of pairs")
 
 # Parameters
-np  = 0.005
+np  = 0.02
 
 # Select n best by var
-setorderv(pairs, cols = c("date", "combo"), order = -1)
+setorder(pairs, date, -combo)
 dt = pairs[, head(.SD, as.integer(np * length(stock1))), by = date]
 
 # At least n rows
@@ -90,13 +91,6 @@ keep_symbols = dt[, .(symbol = c(stock1, stock2))] |>
 removed = setdiff(dt[, unique(c(stock1, stock2))], keep_symbols)
 print(paste("Removed", length(removed), "symbols with less than 50 occurrences",
             "and", length(keep_symbols), "symbols kept"))
-# dt = dt[stock1 %in% keep_symbols | stock2 %in% keep_symbols]
-
-# Plot number of symbols
-dt[, .(symbol = c(stock1, stock2))] |>
-  _[, .N, by = symbol] |>
-  _[order(N)]
-dt[, unique(date)]
 
 # Prices to long format to calculate z score more easly
 prices_long = prices[, .(symbol = toupper(symbol), date, close)]
@@ -109,9 +103,9 @@ universe = list()
 for (i in seq_along(dates)) {
   # i = 5
   # DEBUG
-  if (i -- length(dates)) break
-
   print(i)
+  if (i == length(dates)) break
+
   date_ = dates[i]
   date_start_ = date_ - 200
   if (i == length(dates)) {
@@ -197,7 +191,7 @@ mean_zscore = rbind(
     mean_zscore    = mean(zscore, na.rm = TRUE),
     sum_zscore_bin = sum(zscore > 0, na.rm = TRUE) - sum(zscore <= 0, na.rm = TRUE),
     wmean_zscore   = weighted.mean(zscore, w = rev(1:length(zscore) / sum(1:length(zscore))), na.rm = TRUE)
-    ),by = .(date, stock)]
+  ),by = .(date, stock)]
 mean_rel_ret_10 = rbind(
   universe[, .(date, stock = stock1, rel_ret_10)],
   universe[, .(date, stock = stock2, rel_ret_10 = -rel_ret_10)]
@@ -280,13 +274,26 @@ back = prices[, .(symbol, date, returns, ret_1, ret_1_o_o, ret_1_o_c)] |>
   na.omit() |>
   _[data.table(symbol = keep_symbols)[, keep := 1], on = "symbol"] |>
   na.omit()
-# REBALANCE = "week" # day, week or month
+REBALANCE = "day" # day, week or month
 # back = back[close_raw > 5]
-# if (REBALANCE == "week") {
-#   back[, time_event := lubridate::ceiling_date(date, unit = "week")]
-# } else if (REBALANCE == "month") {
-#   back[, time_event := data.table::yearmon(date)]
-# }
+if (REBALANCE == "week") {
+  back[, date := lubridate::ceiling_date(date, unit = "week")]
+} else if (REBALANCE == "month") {
+  back[, date := data.table::yearmon(date)]
+}
+if (REBALANCE %in% c("week", "month")) {
+  back = back[, .(
+    open            = data.table::first(open),
+    close           = data.table::last(close),
+    mean_zscore     = data.table::last(mean_zscore),
+    mean_rel_ret_10 = data.table::last(mean_rel_ret_10),
+    sum_zscore_bin  = data.table::last(sum_zscore_bin)
+  ), by = .(symbol, date)]
+}
+back[, combo := ((frank(mean_zscore, ties.method = "first") / length(mean_zscore)) +
+                   (frank(mean_rel_ret_10, ties.method = "first")  / length(mean_zscore))) / 2,
+     by = date]
+
 back[, table(keep)]
 setorder(back, date, -wmean_zscore)
 back_short = back[, head(.SD, 50), by = date]
@@ -298,12 +305,12 @@ long_xts = back_long[, .(strategy = sum((1/length(ret_1)) * ret_1_o_o)), by = da
   as.xts.data.table()
 charts.PerformanceSummary(long_xts)
 SharpeRatio.annualized(long_xts, scale = 252)
-SharpeRatio.annualized(long_xts["2021/"], scale = 252)
+# SharpeRatio.annualized(long_xts["2021/"], scale = 252)
 Return.cumulative(long_xts)
 Return.annualized(long_xts, scale = 252)
 StdDev.annualized(long_xts, scale = 252)
 # Short
-short_xts = back_short[, .(strategy = sum((1/length(ret_1)) * ret_1_o_o)), by = date] |>
+short_xts = back_short[, .(strategy = sum(-(1/length(ret_1)) * ret_1_o_o)), by = date] |>
   as.xts.data.table()
 charts.PerformanceSummary(short_xts)
 SharpeRatio.annualized(short_xts, scale = 252)
@@ -350,7 +357,7 @@ back = back[, .(
   sum_zscore_bin  = data.table::last(sum_zscore_bin)
 ), by = .(symbol, time_event)]
 back[, combo := ((frank(mean_zscore, ties.method = "first") / length(mean_zscore)) +
-          (frank(mean_rel_ret_10, ties.method = "first")  / length(mean_zscore))) / 2,
+                   (frank(mean_rel_ret_10, ties.method = "first")  / length(mean_zscore))) / 2,
      by = time_event]
 back[, ret_1 := close / open - 1]
 setorder(back, symbol, time_event)
