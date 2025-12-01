@@ -46,8 +46,7 @@ if (FREQ == "quarter") {
 # Check duplicates
 anyDuplicated(prices, by = c("fmp_symbol", "date"))
 duplicated_symbols = prices[duplicated(prices, by = c("fmp_symbol", "date")), unique(fmp_symbol)]
-paste0(length(duplicated_symbols) / prices[, length(unique(symbol))] * 100, "%")
-prices = prices[symbol %notin% duplicated_symbols]
+paste0(length(duplicated_symbols) / prices[, length(unique(symbol))] * 100, "%")prices = prices[!(fmp_symbol %in% duplicated_symbols)]
 
 # Plots
 quarters = prices[, sort(unique(q))]
@@ -68,7 +67,7 @@ profile = unique(profile[, .(fmp_symbol = symbol, industry, sector, isEtf, isFun
 pairs_universe = list()
 if (FREQ == "month") {
   min_obs = 15
-} else if (FREQ == "month") {
+} else if (FREQ == "quarter") {
   min_obs = 40
 }
 for (i in seq_along(quarters)) {
@@ -113,6 +112,10 @@ for (i in seq_along(quarters)) {
 pairs_universe = rbindlist(pairs_universe)
 setorder(pairs_universe, q)
 nrow(pairs_universe) # 395.898.227; 229.238.862; 160.459.565; 504.948.451
+
+# TODO
+# filter by same sector here so we have lower numbe of symbols in next step
+# pairs_all = pairs_all[same_sector == 1L & same_industry == 1L]
 
 # Save
 file_ = file.path(PATH_SAVE, "pairs.feather")

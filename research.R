@@ -75,15 +75,26 @@ pairs[, .N, by = date][order(date)] |>
   theme_minimal() +
   labs(title = "Number of pairs by quarter", x = "Quantile", y = "Number of pairs")
 
-# Parameters
-np  = 0.02
+# Prices to long format to calculate z score more easly
+prices_long = prices[, .(symbol = toupper(symbol), date, close)]
+prices_long = prices_long[symbol %in% pairs[, stock1] | symbol %in% pairs[, stock2]]
 
 # Select n best by var
-setorder(pairs, date, -combo)
-dt = pairs[, head(.SD, as.integer(np * length(stock1))), by = date]
+setorder(pairs, date, combo)
+dt = pairs[, .(date, stock1, stock2, combo)]
+# 1) Best pairs
+dt = dt[, head(.SD, as.integer(nrow(.SD)*0.01)), by = date]
+# 2) Worst pairs
+# dt = dt[, tail(.SD, as.integer(nrow(.SD)*0.01)), by = date]
+
+# Plot number of pairs through time
+dt[, .N, by = date] |>
+  _[order(date)] |>
+  as.xts.data.table() |>
+  plot()
 
 # At least n rows
-n_ = 10
+n_ = 30
 keep_symbols = dt[, .(symbol = c(stock1, stock2))] |>
   _[, .N, by = symbol] |>
   _[N >= n_] |>
@@ -92,12 +103,16 @@ removed = setdiff(dt[, unique(c(stock1, stock2))], keep_symbols)
 print(paste("Removed", length(removed), "symbols with less than 50 occurrences",
             "and", length(keep_symbols), "symbols kept"))
 
-# Prices to long format to calculate z score more easly
-prices_long = prices[, .(symbol = toupper(symbol), date, close)]
-prices_long = prices_long[symbol %in% pairs[, stock1] | symbol %in% pairs[, stock2]]
 
+# QC DATA -----------------------------------------------------------------
+# Fitler stocks
+bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"), Sys.getenv("BLOB-KEY"))
+cont = storage_container(bl_endp_key, "qc-backtest")
+storage_write_csv(as.data.frame(dt), cont, "pairs_month.csv")
+
+
+# EOD PREDICTORS ----------------------------------------------------------
 # Calculate Zscore for every quarter-day
-dt = dt[, .(date, stock1, stock2)]
 dates = dt[, sort(unique(date))]
 universe = list()
 for (i in seq_along(dates)) {
@@ -106,16 +121,10 @@ for (i in seq_along(dates)) {
   print(i)
   if (i == length(dates)) break
 
+  # filter prices we need
   date_ = dates[i]
   date_start_ = date_ - 200
-  if (i == length(dates)) {
-    p = prices[date %between% c(date_start_, Sys.Date())]
-  } else {
-    p = prices[date %between% c(date_start_, dates[i+1])]
-  }
-  # Test
-  # all(dt[date == date_, stock1] %in% colnames(p))
-  # anyDuplicated(dt[date == date_, stock1])
+  p = prices[date %between% c(date_start_, dates[i+1])]
 
   # 1) Unique pairs for this anchor date
   pairs_ = dt[date == date_, .(stock1, stock2)]
@@ -129,7 +138,6 @@ for (i in seq_along(dates)) {
     data.table(date = dates_win, dummy = 1L),
     on = "dummy", allow.cartesian = TRUE
   ][, dummy := NULL][]
-  # any(is.na(grid))
 
   # 4) Prepare closes for stock1 and stock2 (filter by needed symbols only)
   syms1 = unique(pairs_$stock1)
@@ -148,8 +156,8 @@ for (i in seq_along(dates)) {
     dt_2, on = .(date, stock2)
   ]
   setorder(res, stock1, stock2)
-  # any(is.na(res))
-  # Calculate Z scores
+
+  # alculate Z scores
   res[, ratiospread := close_1 / close_2]
   res[, spreadclose := log(ratiospread)]
   res[, let(
@@ -168,13 +176,14 @@ for (i in seq_along(dates)) {
   res[, zscore := (zscore_20 + zscore_60 + zscore_120) / 3]
 
   # Calculate percent deviation
-  res[, rel_ret_10 := (close_1 / shift(close_1, 10)) / (close_2 / shift(close_2, 10)) - 1]
+  res[, rel_ret_10 := (close_1 / shift(close_1, 10)) / (close_2 / shift(close_2, 10)) - 1,
+      by = .(stock1, stock2)]
 
-  if (i == length(dates)) {
-    res = res[date %between% c(date_, Sys.Date()), .(date, stock1, stock2, zscore, rel_ret_10)]
-  } else {
-    res = res[date %between% c(date_, dates[i+1]), .(date, stock1, stock2, zscore, rel_ret_10)]
-  }
+  # Filter
+  cols_keep_ = c("date", "stock1", "stock2",
+                 "zscore", "zscore_20", "zscore_60", "zscore_120",
+                 "rel_ret_10")
+  res = res[date %between% c(date_, dates[i+1]), ..cols_keep_]
   universe[[i]] = res
 }
 universe = rbindlist(universe)
@@ -184,13 +193,17 @@ unvierse = na.omit(universe)
 
 # Prepare data for QC
 mean_zscore = rbind(
-  universe[, .(date, stock = stock1, zscore)],
-  universe[, .(date, stock = stock2, zscore = -zscore)]
+  universe[, .(date, stock = stock1, zscore, zscore_20, zscore_60, zscore_120)],
+  universe[, .(date, stock = stock2, zscore = -zscore, zscore_20 = -zscore_20,
+               zscore_60 = -zscore_60, zscore_120 = -zscore_120)]
 ) |>
   _[, .(
-    mean_zscore    = mean(zscore, na.rm = TRUE),
-    sum_zscore_bin = sum(zscore > 0, na.rm = TRUE) - sum(zscore <= 0, na.rm = TRUE),
-    wmean_zscore   = weighted.mean(zscore, w = rev(1:length(zscore) / sum(1:length(zscore))), na.rm = TRUE)
+    mean_zscore     = mean(zscore, na.rm = TRUE),
+    mean_zscore_20  = mean(zscore_20, na.rm = TRUE),
+    mean_zscore_60  = mean(zscore_60, na.rm = TRUE),
+    mean_zscore_120 = mean(zscore_120, na.rm = TRUE),
+    sum_zscore_bin  = sum(zscore > 0, na.rm = TRUE) - sum(zscore <= 0, na.rm = TRUE),
+    wmean_zscore    = weighted.mean(zscore, w = rev(1:length(zscore) / sum(1:length(zscore))), na.rm = TRUE)
   ),by = .(date, stock)]
 mean_rel_ret_10 = rbind(
   universe[, .(date, stock = stock1, rel_ret_10)],
@@ -204,9 +217,9 @@ portfolio = prices[, .(symbol, date, returns, ret_1, ret_5, ret_10, ret_22)] |>
   _[mean_indicators, on = c(symbol = "stock", "date")] |>
   na.omit()
 
-# Correlation
+# Correlations
+cor(portfolio[, .(mean_zscore, mean_zscore_20, mean_zscore_60, mean_zscore_120, wmean_zscore)])
 portfolio[, cor(mean_zscore, mean_rel_ret_10)]
-portfolio[, cor(mean_zscore, wmean_zscore)]
 portfolio[, cor(mean_zscore, sum_zscore_bin)]
 
 # Plot regression
@@ -267,14 +280,18 @@ portfolio[, .(bin = dplyr::ntile(mean_rel_ret_10, 20), ret_22), by = date] |>
   geom_bar(stat = "identity")
 
 
-# BACKTEST DAILY ---------------------------------------------------------
-# Backtest - CS with DAILY rebalancing
-back = prices[, .(symbol, date, returns, ret_1, ret_1_o_o, ret_1_o_c)] |>
-  _[mean_indicators, on = c(symbol = "stock", "date")] |>
-  na.omit() |>
-  _[data.table(symbol = keep_symbols)[, keep := 1], on = "symbol"] |>
-  na.omit()
+# CS BACKTESTING ----------------------------------------------------------
+# Params
 REBALANCE = "day" # day, week or month
+
+# Filter data we need for backtest
+cols = c("symbol", "date", "returns", "ret_1", "close", "open", "close_raw",
+         "ret_1_o_o", "ret_1_o_c", "ret_2_o_c")
+back = prices[, ..cols] |>
+  _[mean_indicators, on = c(symbol = "stock", "date")] |>
+  na.omit()
+
+# Upsample
 # back = back[close_raw > 5]
 if (REBALANCE == "week") {
   back[, date := lubridate::ceiling_date(date, unit = "week")]
@@ -283,37 +300,39 @@ if (REBALANCE == "week") {
 }
 if (REBALANCE %in% c("week", "month")) {
   back = back[, .(
+    date            = data.table::last(date),
     open            = data.table::first(open),
     close           = data.table::last(close),
     mean_zscore     = data.table::last(mean_zscore),
     mean_rel_ret_10 = data.table::last(mean_rel_ret_10),
     sum_zscore_bin  = data.table::last(sum_zscore_bin)
-  ), by = .(symbol, date)]
+  ), by = .(symbol, time_event)]
+  back[, combo := ((frank(mean_zscore, ties.method = "first") / length(mean_zscore)) +
+                     (frank(mean_rel_ret_10, ties.method = "first")  / length(mean_zscore))) / 2,
+       by = date]
+  setorder(back, symbol, time_event)
+  back[, ret_1 := shift(ret_1, 1L, type = "lead"), by = symbol]
+  back = na.omit(back)
 }
-back[, combo := ((frank(mean_zscore, ties.method = "first") / length(mean_zscore)) +
-                   (frank(mean_rel_ret_10, ties.method = "first")  / length(mean_zscore))) / 2,
-     by = date]
-
-back[, table(keep)]
-setorder(back, date, -wmean_zscore)
-back_short = back[, head(.SD, 50), by = date]
-back_long  = back[, tail(.SD, 50), by = date]
-# setorder(back_long, date, -mean_rel_ret_10)
-# back_long = back_long[, tail(.SD, 50), by = date]
-# Long
-long_xts = back_long[, .(strategy = sum((1/length(ret_1)) * ret_1_o_o)), by = date] |>
-  as.xts.data.table()
+back[, hist(mean_zscore)]
+setorder(back, date, -mean_zscore)
+n = 20
+back_long  = back[, tail(.SD, n), by = date]
+back_short = back[, head(.SD, n), by = date]
+# Long only
+long_xts = back_long[, .(strategy = sum((1/length(ret_1)) * ret_2_o_c)), by = date]
+if (REBALANCE == "month") {
+  long_xts[, time_event := zoo::as.yearmon.default(date)]
+}
+long_xts = as.xts.data.table(long_xts)
 charts.PerformanceSummary(long_xts)
-SharpeRatio.annualized(long_xts, scale = 252)
-# SharpeRatio.annualized(long_xts["2021/"], scale = 252)
-Return.cumulative(long_xts)
-Return.annualized(long_xts, scale = 252)
-StdDev.annualized(long_xts, scale = 252)
-# Short
+scale_ = if (REBALANCE == "week") 52 else if (REBALANCE == "month") 12 else 252
+finutils::portfolio_stats(long_xts, scale = scale_)
+# Short only
 short_xts = back_short[, .(strategy = sum(-(1/length(ret_1)) * ret_1_o_o)), by = date] |>
   as.xts.data.table()
 charts.PerformanceSummary(short_xts)
-SharpeRatio.annualized(short_xts, scale = 252)
+finutils::portfolio_stats(short_xts, scale = 252)
 # Long short
 long_short = cbind(long_xts, short_xts)
 long_short$strategy_combo = (long_short$strategy/2) + (long_short$`strategy.1` / 2)
@@ -322,7 +341,13 @@ Return.annualized(long_short, scale = 252)
 SharpeRatio.annualized(long_short, scale = 252)
 lapply(Drawdowns(long_short), min)
 # Save symbols for Quantconnect
-qc_data = back_long[, .(date, symbol, weight = 1/50)]
+if (REBALANCE == "month") {
+  qc_data = back_long[, .(month = time_event, date, symbol, weight = 1/10)]
+  qc_data[, date_month := zoo::as.Date.yearmon(month, frac = 1)]
+} else if (REBALANCE == "week") {
+  qc_data = back_long[, .(date, symbol, weight = 1/30)]
+}
+qc_data = back_long[, .(date, symbol, weight = 1/20)]
 qc_data[, date_adv := vapply(date, qlcal::advanceDate, days = 1L, numeric(1L))]
 qc_data[, date_adv := as.Date(date_adv)]
 qc_data[, date := as.character(date_adv)]
@@ -333,87 +358,6 @@ storage_write_csv(as.data.frame(qc_data), cont, "pairs_ensamble.csv")
 # Comapre local and qc
 head(qc_data[as.Date(date) > as.Date("2023-01-01")], 55) |>
   _[order(date, symbol)]
-
-
-# BACKTEST WEEKLY ---------------------------------------------------------
-# Backtest - CS with weekly rebalancing
-back = prices[, .(symbol, date, returns, ret_1, close, open, close_raw)] |>
-  _[mean_indicators, on = c(symbol = "stock", "date")] |>
-  na.omit()
-REBALANCE = "week" # week or month
-back = back[close_raw > 5]
-if (REBALANCE == "week") {
-  back[, time_event := lubridate::ceiling_date(date, unit = "week")]
-} else if (REBALANCE == "month") {
-  back[, time_event := data.table::yearmon(date)]
-}
-back[, unique(time_event)]
-back = back[, .(
-  date            = data.table::last(date),
-  open            = data.table::first(open),
-  close           = data.table::last(close),
-  mean_zscore     = data.table::last(mean_zscore),
-  mean_rel_ret_10 = data.table::last(mean_rel_ret_10),
-  sum_zscore_bin  = data.table::last(sum_zscore_bin)
-), by = .(symbol, time_event)]
-back[, combo := ((frank(mean_zscore, ties.method = "first") / length(mean_zscore)) +
-                   (frank(mean_rel_ret_10, ties.method = "first")  / length(mean_zscore))) / 2,
-     by = time_event]
-back[, ret_1 := close / open - 1]
-setorder(back, symbol, time_event)
-back[, ret_1 := shift(ret_1, 1L, type = "lead"), by = symbol]
-back = na.omit(back)
-setorder(back, time_event, -mean_zscore)
-back_short = back[, head(.SD, 50), by = time_event]
-back_long  = back[, tail(.SD, 50), by = time_event]
-# back_long  = back[, .SD[mean_zscore < -3], by = time_event]
-# Long
-long_xts = back_long[, .(strategy = sum((1/length(ret_1)) * ret_1) - 0.001), by = time_event]
-if (REBALANCE == "month") {
-  long_xts[, time_event := zoo::as.yearmon.default(time_event)]
-}
-long_xts = as.xts.data.table(long_xts)
-charts.PerformanceSummary(long_xts)
-SharpeRatio.annualized(long_xts, scale = if (REBALANCE == "week") 52 else 12)
-Return.annualized(long_xts, scale = if (REBALANCE == "week") 52 else 12)
-StdDev.annualized(long_xts, scale = if (REBALANCE == "week") 52 else 12)
-# Shortshort_xts = back_short[, .(strategy = sum(-(1/length(ret_1)) * ret_1)), by = time_event]
-short_xts = back_short[, .(strategy = sum((1/length(ret_1)) * ret_1)), by = time_event]
-if (REBALANCE == "month") short_xts[, time_event := zoo::as.yearmon.default(time_event)]
-short_xts = as.xts.data.table(short_xts)
-charts.PerformanceSummary(short_xts)
-SharpeRatio.annualized(short_xts, scale = if (REBALANCE == "week") 52 else 12)
-Return.annualized(short_xts, scale = if (REBALANCE == "week") 52 else 12)
-# Long short
-long_short = cbind(long_xts, short_xts)
-long_short$strategy_combo = (long_short$strategy) + (long_short$`strategy.1`)
-charts.PerformanceSummary(long_short)
-Return.annualized(long_short, scale = if (REBALANCE == "week") 52 else 12)
-SharpeRatio.annualized(long_short, scale = if (REBALANCE == "week") 52 else 12)
-lapply(Drawdowns(long_short), min)
-# Save symbols for Quantconnect
-# qc_data = rbind(
-#   back_long[, .(date = time_event, symbol, weight = 1/20)],
-#   back_short[, .(date = time_event, symbol, weight = -1/20)]
-# )
-if (REBALANCE == "month") {
-  qc_data = back_long[, .(month = time_event, date, symbol, weight = 1/10)]
-  qc_data[, date_month := zoo::as.Date.yearmon(month, frac = 1)]
-} else if (REBALANCE == "week") {
-  qc_data = back_long[, .(date, symbol, weight = 1/30)]
-}
-qc_data[, sort(unique(date))]
-qc_data[, date := as.character(date_month)]
-qc_data = qc_data[, .(date, symbol, weight)]
-bl_endp_key = storage_endpoint(Sys.getenv("BLOB-ENDPOINT"), Sys.getenv("BLOB-KEY"))
-cont = storage_container(bl_endp_key, "qc-backtest")
-storage_write_csv(as.data.frame(qc_data), cont, "pairs_ensamble.csv")
-# Compare QC and local
-setorder(qc_data, date, symbol)
-qc_data[, unique(date)]
-
-qc_data[date == "2020-08-02"]
-qc_data[date == "2020-08-09"]
 
 
 # TIME SERIES REBALANCING -------------------------------------------------
@@ -489,6 +433,5 @@ charts.PerformanceSummary(y_)
 SharpeRatio.annualized(na.omit(y_), scale = 252)
 
 
-# SUM BUY/SELL ------------------------------------------------------------
 
 
